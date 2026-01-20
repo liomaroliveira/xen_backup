@@ -76,3 +76,38 @@ Os logs de execução são salvos automaticamente na raiz do diretório criado n
 
 - Formato do Log de Backup: `backup_log_DATA.txt`
 - Formato do Log de Auditoria: `audit_log_DATA.txt`
+
+---
+
+## Proteção contra Quedas de Conexão (Screen)
+
+Como o processo de backup de VMs grandes pode demorar horas, é altamente recomendável rodar os scripts dentro de uma sessão **Screen**. Isso garante que o backup continue rodando no servidor mesmo que sua internet caia ou seu computador desligue.
+
+### Instalação
+Caso o comando `screen` não exista:
+
+    yum install screen
+
+### Passo a Passo Seguro
+
+1. **Inicie uma sessão persistente:**
+   Antes de rodar o script, crie a sessão:
+   
+    screen -S backup_session
+
+2. **Execute o script dentro dela:**
+   
+    ./wizard_backup.sh
+
+3. **Para sair e deixar rodando (Detach):**
+   Se precisar desligar seu computador ou fechar o SSH:
+   - Pressione `Ctrl + A` (e solte).
+   - Pressione `D`.
+   - *O terminal voltará para o shell normal, mas o script continua rodando no fundo.*
+
+4. **Para voltar e conferir (Reattach):**
+   Ao acessar o servidor novamente:
+   
+    screen -r backup_session
+
+   - *Se a sessão parecer "travada" ou "morta", use `screen -d -r` para forçar a reconexão.*
