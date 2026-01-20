@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE AUDITORIA TOTAL XENSERVER -> USB
+# WIZARD DE AUDITORIA TOTAL XENSERVER - V2.0
 # ==========================================
 
 # Configurações Iniciais
@@ -19,7 +19,7 @@ log_msg() {
 
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE AUDITORIA DE VMS (INFO 100%) "
+log_msg "   WIZARD DE AUDITORIA (HOST + VMS) V2.0  "
 log_msg "=========================================="
 log_msg "Data: $DATE_NOW"
 
@@ -27,7 +27,7 @@ log_msg "Data: $DATE_NOW"
 # 1. DETECÇÃO E MONTAGEM DO USB
 # ----------------------------------------
 echo ""
-log_msg "[1/3] Detectando armazenamento..."
+log_msg "[1/4] Detectando armazenamento..."
 
 > /tmp/disk_list
 
@@ -64,12 +64,14 @@ echo ""
 # ----------------------------------------
 # 2. MONTAGEM
 # ----------------------------------------
-log_msg "[2/3] Configuração de Montagem"
+log_msg "[2/4] Configuração de Montagem"
 if mountpoint -q $MOUNT_POINT; then
     umount $MOUNT_POINT
 fi
 
 read -p "Deseja FORMATAR este disco para EXT4 AGORA? (Digite 'n' se já formatou) [s/N]: " format_opt
+# CORREÇÃO DO ENTER: Define 'n' como padrão se estiver vazio
+format_opt=${format_opt:-n}
 
 mkdir -p $MOUNT_POINT
 
@@ -97,79 +99,128 @@ if ! mountpoint -q $MOUNT_POINT; then
     exit 1
 fi
 
-# ----------------------------------------
-# 3. EXTRAÇÃO DE DADOS (LOOP TOTAL)
-# ----------------------------------------
-echo ""
-log_msg "[3/3] Iniciando Extração Completa de Dados..."
-log_msg "Este script irá varrer TODAS as VMs e salvar os dados em .txt individuais."
-
-# Cria pasta organizada com a data
+# Cria pasta organizada
 AUDIT_DIR="$MOUNT_POINT/AUDITORIA_$DATE_NOW"
 mkdir -p "$AUDIT_DIR"
 
-VM_UUID_LIST=$(xe vm-list is-control-domain=false is-a-snapshot=false params=uuid --minimal | tr ',' ' ')
+# ----------------------------------------
+# 3. EXTRAÇÃO DE DADOS DO SERVIDOR (HOST)
+# ----------------------------------------
+echo ""
+log_msg "[3/4] Coletando Dados do Servidor (Host Físico)..."
 
+# Lista Hosts (geralmente é um, mas previne erro em pool)
+HOST_UUID_LIST=$(xe host-list params=uuid --minimal | tr ',' ' ')
+
+for host_uuid in $HOST_UUID_LIST; do
+    HOSTNAME=$(xe host-param-get uuid=$host_uuid param-name=name-label)
+    FILE_HOST="$AUDIT_DIR/SERVER_${HOSTNAME}_INFO.txt"
+    
+    log_msg ">>> Auditando Host: $HOSTNAME"
+    
+    echo "=================================================================" > "$FILE_HOST"
+    echo " RELATÓRIO DO SERVIDOR FÍSICO: $HOSTNAME" >> "$FILE_HOST"
+    echo " UUID: $host_uuid" >> "$FILE_HOST"
+    echo " DATA: $DATE_NOW" >> "$FILE_HOST"
+    echo "=================================================================" >> "$FILE_HOST"
+    
+    echo "--- [1] INFO GERAL E VERSÃO ---" >> "$FILE_HOST"
+    xe host-list uuid=$host_uuid params=all >> "$FILE_HOST"
+    
+    echo "" >> "$FILE_HOST"
+    echo "--- [2] CPUs E HARDWARE ---" >> "$FILE_HOST"
+    xe host-cpu-list host-uuid=$host_uuid params=all >> "$FILE_HOST"
+    
+    echo "" >> "$FILE_HOST"
+    echo "--- [3] PLACAS DE REDE FÍSICAS (PIFs) ---" >> "$FILE_HOST"
+    xe pif-list host-uuid=$host_uuid params=all >> "$FILE_HOST"
+    
+    echo "" >> "$FILE_HOST"
+    echo "--- [4] PATCHES INSTALADOS ---" >> "$FILE_HOST"
+    xe patch-list hosts:contains=$host_uuid >> "$FILE_HOST"
+    
+    echo "" >> "$FILE_HOST"
+    echo "--- [5] PARAM-LIST COMPLETO ---" >> "$FILE_HOST"
+    xe host-param-list uuid=$host_uuid >> "$FILE_HOST"
+done
+
+# ----------------------------------------
+# 4. EXTRAÇÃO DE DADOS DAS VMS
+# ----------------------------------------
+echo ""
+log_msg "[4/4] Coletando Dados das VMs..."
+
+VM_UUID_LIST=$(xe vm-list is-control-domain=false is-a-snapshot=false params=uuid --minimal | tr ',' ' ')
 COUNT=0
 
 for uuid in $VM_UUID_LIST; do
     NAME=$(xe vm-param-get uuid=$uuid param-name=name-label)
     SAFE_NAME=$(echo "$NAME" | tr -d '[:cntrl:]' | tr -s ' ' '_' | tr -cd '[:alnum:]_.-')
-    FILE_OUT="$AUDIT_DIR/${SAFE_NAME}_FULL_INFO.txt"
+    FILE_OUT="$AUDIT_DIR/VM_${SAFE_NAME}_INFO.txt"
     
-    log_msg "------------------------------------------------"
-    log_msg ">>> Coletando dados de: $NAME"
+    log_msg ">>> Auditando VM: $NAME"
     
     echo "=================================================================" > "$FILE_OUT"
     echo " RELATÓRIO TÉCNICO COMPLETO: $NAME" >> "$FILE_OUT"
     echo " UUID: $uuid" >> "$FILE_OUT"
-    echo " DATA COLETA: $DATE_NOW" >> "$FILE_OUT"
+    echo " DATA: $DATE_NOW" >> "$FILE_OUT"
     echo "=================================================================" >> "$FILE_OUT"
-    echo "" >> "$FILE_OUT"
     
     echo "--- [1] RESUMO GERAL ---" >> "$FILE_OUT"
     xe vm-list uuid=$uuid params=all >> "$FILE_OUT"
-    echo "" >> "$FILE_OUT"
     
-    echo "--- [2] PARÂMETROS DETALHADOS (PARAM-LIST) ---" >> "$FILE_OUT"
+    echo "" >> "$FILE_OUT"
+    echo "--- [2] PARÂMETROS COMPLETOS ---" >> "$FILE_OUT"
     xe vm-param-list uuid=$uuid >> "$FILE_OUT"
-    echo "" >> "$FILE_OUT"
     
-    echo "--- [3] DISCOS VIRTUAIS (VBDs/VDIs) ---" >> "$FILE_OUT"
-    # Lista VBDs associados e seus detalhes
+    echo "" >> "$FILE_OUT"
+    echo "--- [3] DISCOS (VBDs) ---" >> "$FILE_OUT"
     VBD_LIST=$(xe vbd-list vm-uuid=$uuid params=uuid --minimal | tr ',' ' ')
     for vbd in $VBD_LIST; do
-         echo "  [VBD UUID: $vbd]" >> "$FILE_OUT"
+         echo "[VBD: $vbd]" >> "$FILE_OUT"
          xe vbd-param-list uuid=$vbd >> "$FILE_OUT"
-         echo "  ..." >> "$FILE_OUT"
     done
+    
     echo "" >> "$FILE_OUT"
-
-    echo "--- [4] INTERFACES DE REDE (VIFs) ---" >> "$FILE_OUT"
-    # Lista VIFs associados e seus detalhes (MAC, Network, etc)
+    echo "--- [4] REDES (VIFs) ---" >> "$FILE_OUT"
     VIF_LIST=$(xe vif-list vm-uuid=$uuid params=uuid --minimal | tr ',' ' ')
     for vif in $VIF_LIST; do
-         echo "  [VIF UUID: $vif]" >> "$FILE_OUT"
+         echo "[VIF: $vif]" >> "$FILE_OUT"
          xe vif-param-list uuid=$vif >> "$FILE_OUT"
-         echo "  ..." >> "$FILE_OUT"
     done
-    echo "" >> "$FILE_OUT"
     
-    echo "--- [5] SNAPSHOTS ASSOCIADOS ---" >> "$FILE_OUT"
-    xe snapshot-list snapshot-of=$uuid >> "$FILE_OUT"
-    
-    log_msg "    [OK] Salvo em: $SAFE_NAME_FULL_INFO.txt"
+    log_msg "    [OK] Salvo."
     ((COUNT++))
 done
 
 log_msg "------------------------------------------------"
-log_msg "Processo finalizado. $COUNT VMs auditadas."
-log_msg "Arquivos salvos na pasta: AUDITORIA_$DATE_NOW"
+log_msg "Auditoria finalizada. $COUNT VMs + Hosts auditados."
 
 # Copia log para o HD
 cp "$TEMP_LOG" "$AUDIT_DIR/auditoria_log.txt"
 
+# ----------------------------------------
+# 5. FINALIZAÇÃO (MANTER MONTADO?)
+# ----------------------------------------
 echo ""
-log_msg "Desmontando disco..."
-umount $MOUNT_POINT
-log_msg "Pode remover o disco."
+log_msg "O processo de escrita terminou."
+read -p "Deseja DESMONTAR o disco agora e remover com segurança? [S/n]: " umount_opt
+# Padrão = Sim (S)
+umount_opt=${umount_opt:-S}
+
+if [[ "$umount_opt" =~ ^[sS]$ ]]; then
+    log_msg "Desmontando disco..."
+    umount $MOUNT_POINT
+    log_msg "Disco desmontado. Pode remover o dispositivo."
+else
+    log_msg "------------------------------------------------"
+    log_msg "AVISO: O disco PERMANECE MONTADO em:"
+    log_msg "-> $AUDIT_DIR"
+    log_msg "------------------------------------------------"
+    echo "Listando arquivos gerados:"
+    echo ""
+    # Lista arquivos com tamanho legível e data
+    ls -lh --time-style=long-iso "$AUDIT_DIR"
+    echo ""
+    log_msg "ATENÇÃO: Lembre-se de rodar 'umount $MOUNT_POINT' antes de remover o USB."
+fi
