@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V6.0 (LOGGING)
+# WIZARD DE BACKUP XENSERVER - V7.0 (LIVE MONITOR)
 # ==========================================
 
 # Configurações Iniciais
@@ -10,18 +10,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILENAME="backup_log_${DATE_NOW}.txt"
 TEMP_LOG="/tmp/${LOG_FILENAME}"
 
-# Função de Log (Exibe na tela e salva em arquivo temporário)
+# Função de Log
 log_msg() {
     local msg="$1"
     echo "$msg"
     echo "[$(date '+%H:%M:%S')] $msg" >> "$TEMP_LOG"
 }
 
+# Função de Monitoramento em Tempo Real
+monitor_export() {
+    local pid=$1
+    local file=$2
+    local delay=3
+    
+    echo "    (Monitorando tamanho do arquivo a cada ${delay}s...)"
+    # Loop enquanto o processo (PID) existir
+    while kill -0 $pid 2>/dev/null; do
+        if [ -f "$file" ]; then
+            # Obtém tamanho legível (ex: 1.2G)
+            current_size=$(ls -rh "$file" | awk '{print $5}')
+            # \r volta para o início da linha, \033[K limpa o resto da linha
+            echo -ne "    >> Tamanho Atual: $current_size \r"
+        fi
+        sleep $delay
+    done
+    echo -ne "\n" # Nova linha ao terminar
+}
+
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE EXPORTAÇÃO XENSERVER -> USB  "
+log_msg "   WIZARD DE BACKUP XENSERVER - V7.0      "
 log_msg "=========================================="
-log_msg "Iniciando script em: $DATE_NOW"
+log_msg "Data: $DATE_NOW"
 
 # ----------------------------------------
 # 1. DETECÇÃO E MONTAGEM DO USB
@@ -70,6 +90,7 @@ if mountpoint -q $MOUNT_POINT; then
 fi
 
 read -p "Deseja FORMATAR este disco para EXT4 AGORA? (Digite 'n' se já formatou) [s/N]: " format_opt
+format_opt=${format_opt:-n}
 
 mkdir -p $MOUNT_POINT
 
@@ -77,11 +98,11 @@ if [[ "$format_opt" =~ ^[sS]$ ]]; then
     log_msg "!!! ATENÇÃO: DADOS EM $USB_DEVICE SERÃO APAGADOS !!!"
     read -p "Digite 'SIM' para confirmar: " confirm
     if [ "$confirm" == "SIM" ]; then
-        log_msg "Formatando dispositivo..."
+        log_msg "Formatando..."
         mkfs.ext4 -F "$USB_DEVICE" >> "$TEMP_LOG" 2>&1
         mount "$USB_DEVICE" $MOUNT_POINT
     else
-        log_msg "Cancelado pelo usuário."
+        log_msg "Cancelado."
         exit 0
     fi
 else
@@ -98,7 +119,14 @@ if ! mountpoint -q $MOUNT_POINT; then
 fi
 
 FREE_SPACE=$(df -h $MOUNT_POINT | awk 'NR==2 {print $4}')
-log_msg ">> Disco montado com sucesso (Livre: $FREE_SPACE)"
+log_msg ">> Disco montado (Livre: $FREE_SPACE)"
+
+# NOVA PERGUNTA SOLICITADA
+echo ""
+read -p "Deseja DESMONTAR automaticamente ao final? [S/n]: " auto_unmount_opt
+AUTO_UNMOUNT=${auto_unmount_opt:-S}
+log_msg ">> Opção de desmontagem automática: $AUTO_UNMOUNT"
+
 
 # ----------------------------------------
 # 3. LISTAGEM DETALHADA DE VMS
@@ -197,7 +225,11 @@ for vm_id in $selection; do
 
     if [ "$STATE" == "halted" ]; then
         log_msg "    Modo: Exportação Direta (Desligada)"
-        xe vm-export vm=$UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 || EXPORT_ERROR=1
+        # Roda em Background (&) para monitorar
+        xe vm-export vm=$UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 &
+        EXPORT_PID=$!
+        monitor_export $EXPORT_PID "$FILE_NAME"
+        wait $EXPORT_PID || EXPORT_ERROR=1
     else
         log_msg "    1. Criando snapshot temporário..."
         SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP")
@@ -207,7 +239,11 @@ for vm_id in $selection; do
         xe vm-param-set uuid=$TEMP_VM_UUID is-a-template=false 2>/dev/null
         
         log_msg "    3. Exportando (Aguarde)..."
-        xe vm-export vm=$TEMP_VM_UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 || EXPORT_ERROR=1
+        # Roda em Background (&) para monitorar
+        xe vm-export vm=$TEMP_VM_UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 &
+        EXPORT_PID=$!
+        monitor_export $EXPORT_PID "$FILE_NAME"
+        wait $EXPORT_PID || EXPORT_ERROR=1
         
         log_msg "    4. Limpando temporários..."
         xe vm-uninstall uuid=$TEMP_VM_UUID force=true >> "$TEMP_LOG" 2>&1
@@ -239,11 +275,18 @@ log_msg "Salvando logs..."
 cp "$TEMP_LOG" "$SCRIPT_DIR/$LOG_FILENAME"
 cp "$TEMP_LOG" "$MOUNT_POINT/$LOG_FILENAME"
 
-log_msg "Logs salvos em:"
-log_msg "1. $SCRIPT_DIR/$LOG_FILENAME"
-log_msg "2. USB: /$LOG_FILENAME"
-
-echo ""
-log_msg "Desmontando disco..."
-umount $MOUNT_POINT
-log_msg "Processo concluído. Pode remover o disco."
+# ----------------------------------------
+# 5. FINALIZAÇÃO
+# ----------------------------------------
+if [[ "$AUTO_UNMOUNT" =~ ^[sS]$ ]]; then
+    echo ""
+    log_msg "Desmontando disco (Automático)..."
+    umount $MOUNT_POINT
+    log_msg "Processo concluído. Pode remover o disco."
+else
+    echo ""
+    log_msg "AVISO: O disco PERMANECE MONTADO (Opção do usuário)."
+    log_msg "Local: $MOUNT_POINT"
+    echo "Conteúdo atual:"
+    ls -lh "$MOUNT_POINT"
+fi
