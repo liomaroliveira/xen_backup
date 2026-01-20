@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V7.0 (LIVE MONITOR)
+# WIZARD DE BACKUP XENSERVER - V8.0 (STABLE)
 # ==========================================
 
 # Configurações Iniciais
@@ -17,29 +17,31 @@ log_msg() {
     echo "[$(date '+%H:%M:%S')] $msg" >> "$TEMP_LOG"
 }
 
-# Função de Monitoramento em Tempo Real
+# Função de Monitoramento Melhorada
 monitor_export() {
     local pid=$1
     local file=$2
     local delay=3
     
-    echo "    (Monitorando tamanho do arquivo a cada ${delay}s...)"
-    # Loop enquanto o processo (PID) existir
+    echo "    (Monitorando progresso...)"
+    # Loop enquanto o processo existe
     while kill -0 $pid 2>/dev/null; do
         if [ -f "$file" ]; then
-            # Obtém tamanho legível (ex: 1.2G)
-            current_size=$(ls -rh "$file" | awk '{print $5}')
-            # \r volta para o início da linha, \033[K limpa o resto da linha
-            echo -ne "    >> Tamanho Atual: $current_size \r"
+            # Pega tamanho legível
+            current_size=$(ls -lh "$file" | awk '{print $5}')
+            if [ -n "$current_size" ]; then
+                # Imprime sobrescrevendo a linha atual (\r)
+                printf "    >> Tamanho Atual do Arquivo: %-10s\r" "$current_size"
+            fi
         fi
         sleep $delay
     done
-    echo -ne "\n" # Nova linha ao terminar
+    echo "" # Pula linha ao finalizar
 }
 
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE BACKUP XENSERVER - V7.0      "
+log_msg "   WIZARD DE BACKUP XENSERVER - V8.0      "
 log_msg "=========================================="
 log_msg "Data: $DATE_NOW"
 
@@ -121,7 +123,6 @@ fi
 FREE_SPACE=$(df -h $MOUNT_POINT | awk 'NR==2 {print $4}')
 log_msg ">> Disco montado (Livre: $FREE_SPACE)"
 
-# NOVA PERGUNTA SOLICITADA
 echo ""
 read -p "Deseja DESMONTAR automaticamente ao final? [S/n]: " auto_unmount_opt
 AUTO_UNMOUNT=${auto_unmount_opt:-S}
@@ -188,7 +189,8 @@ for sr in $SR_LVM_LIST; do
 done
 TOTAL_FREE_GB=$((TOTAL_SR_FREE / 1024 / 1024 / 1024))
 
-log_msg "ESPAÇO LIVRE NO SERVIDOR (LVM): ~${TOTAL_FREE_GB} GB"
+log_msg "ESPAÇO LIVRE NO SERVIDOR (Soma de todos SRs): ~${TOTAL_FREE_GB} GB"
+log_msg "NOTA: Se um Storage específico estiver cheio, o backup falhará mesmo sobrando espaço em outro."
 echo ""
 
 echo "Digite os números das VMs para backup (Ex: 1 3 4)"
@@ -225,21 +227,30 @@ for vm_id in $selection; do
 
     if [ "$STATE" == "halted" ]; then
         log_msg "    Modo: Exportação Direta (Desligada)"
-        # Roda em Background (&) para monitorar
         xe vm-export vm=$UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 &
         EXPORT_PID=$!
         monitor_export $EXPORT_PID "$FILE_NAME"
         wait $EXPORT_PID || EXPORT_ERROR=1
     else
         log_msg "    1. Criando snapshot temporário..."
-        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP")
+        # Tenta criar snapshot. Se falhar, captura erro
+        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP" 2>&1)
+        SNAP_RET=$?
+        
+        # Verifica se o UUID retornado é válido (sem espaços, erros) e se o comando deu certo
+        if [ $SNAP_RET -ne 0 ] || [[ "$SNAP_UUID" == *"Error"* ]]; then
+            log_msg "    [ERRO CRÍTICO] Falha ao criar snapshot!"
+            log_msg "    Motivo provável: Disco do Servidor (Storage Repository) cheio."
+            log_msg "    Detalhe: $SNAP_UUID"
+            ((FAIL_COUNT++))
+            continue
+        fi
         
         log_msg "    2. Convertendo snapshot em VM temporária..."
         TEMP_VM_UUID=$(xe vm-clone uuid=$SNAP_UUID new-name-label="BACKUP_TEMP_VM")
         xe vm-param-set uuid=$TEMP_VM_UUID is-a-template=false 2>/dev/null
         
         log_msg "    3. Exportando (Aguarde)..."
-        # Roda em Background (&) para monitorar
         xe vm-export vm=$TEMP_VM_UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 &
         EXPORT_PID=$!
         monitor_export $EXPORT_PID "$FILE_NAME"
@@ -259,7 +270,7 @@ for vm_id in $selection; do
         log_msg "    [DETALHES] Tamanho: $FSIZE | Tempo: ${DURATION}s"
         ((SUCCESS_COUNT++))
     else
-        log_msg "    [ERRO] Falha ao exportar VM $VM_NAME. Verifique o log."
+        log_msg "    [ERRO] Falha ao exportar VM $VM_NAME."
         ((FAIL_COUNT++))
     fi
 done
@@ -270,7 +281,6 @@ log_msg "Sucessos: $SUCCESS_COUNT"
 log_msg "Falhas:   $FAIL_COUNT"
 log_msg "------------------------------------------------"
 
-# Salvar logs
 log_msg "Salvando logs..."
 cp "$TEMP_LOG" "$SCRIPT_DIR/$LOG_FILENAME"
 cp "$TEMP_LOG" "$MOUNT_POINT/$LOG_FILENAME"
