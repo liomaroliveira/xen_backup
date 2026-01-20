@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V3.0 (DETAILED)
+# WIZARD DE BACKUP XENSERVER - V4.0 (FIXED)
 # ==========================================
 
 MOUNT_POINT="/mnt/usb_backup_wizard"
@@ -17,20 +17,17 @@ echo "=========================================="
 echo ""
 echo "[1/4] Detectando armazenamento..."
 
-# Limpa lista anterior
 > /tmp/disk_list
 
-# Lista discos sd* excluindo o sda (sistema)
 lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -v "sda" | grep "sd" | while read -r line; do
     echo "$line" >> /tmp/disk_list
 done
 
 if [ ! -s /tmp/disk_list ]; then
-    echo "ERRO: Nenhum disco USB detectado (apenas sda encontrado)."
+    echo "ERRO: Nenhum disco USB detectado."
     exit 1
 fi
 
-# Mostra opções numeradas
 mapfile -t DISKS < /tmp/disk_list
 i=1
 for disk in "${DISKS[@]}"; do
@@ -45,7 +42,7 @@ USB_DEVICE_NAME=$(echo "$selected_disk_info" | awk '{print $1}')
 USB_DEVICE="/dev/$USB_DEVICE_NAME"
 
 if [ -z "$USB_DEVICE_NAME" ]; then
-    echo "Opção inválida. Saindo."
+    echo "Opção inválida."
     exit 1
 fi
 
@@ -60,7 +57,8 @@ if mountpoint -q $MOUNT_POINT; then
     umount $MOUNT_POINT
 fi
 
-read -p "Deseja FORMATAR este disco AGORA? (Digite 'n' se já formatou) [s/N]: " format_opt
+# ALTERAÇÃO SOLICITADA: Texto atualizado
+read -p "Deseja FORMATAR este disco para EXT4 AGORA? (Digite 'n' se já formatou) [s/N]: " format_opt
 
 mkdir -p $MOUNT_POINT
 
@@ -76,7 +74,6 @@ if [[ "$format_opt" =~ ^[sS]$ ]]; then
         exit 0
     fi
 else
-    # Tenta montar sde1, se falhar tenta sde
     if [ -b "${USB_DEVICE}1" ]; then
         mount "${USB_DEVICE}1" $MOUNT_POINT 2>/dev/null || mount "$USB_DEVICE" $MOUNT_POINT
     else
@@ -85,7 +82,7 @@ else
 fi
 
 if ! mountpoint -q $MOUNT_POINT; then
-    echo "ERRO: Falha ao montar. Remova e insira o USB novamente."
+    echo "ERRO: Falha ao montar."
     exit 1
 fi
 
@@ -96,51 +93,71 @@ echo ">> Disco pronto (Livre: $FREE_SPACE)"
 # 3. LISTAGEM DETALHADA DE VMS
 # ----------------------------------------
 echo ""
-echo "[3/4] Carregando detalhes das VMs (Aguarde...)"
-echo "---------------------------------------------------------------------------------"
-printf "%-3s | %-20s | %-10s | %-10s | %-15s\n" "ID" "NOME" "STATUS" "HW (C/M)" "DISCO TOTAL"
-echo "---------------------------------------------------------------------------------"
+echo "[3/4] Carregando detalhes das VMs..."
+# ALTERAÇÃO SOLICITADA: Nova coluna USO REAL
+echo "--------------------------------------------------------------------------------------------------"
+printf "%-3s | %-20s | %-8s | %-10s | %-12s | %-12s\n" "ID" "NOME" "STATUS" "HW (C/M)" "DISCO TOTAL" "DISCO EM USO"
+echo "--------------------------------------------------------------------------------------------------"
 
-# Arrays para armazenar dados
 declare -a UUIDS
 declare -a NAMES
 declare -a STATES
 
-# Pega lista crua de UUIDs (sem control domain e sem snapshots)
 VM_UUID_LIST=$(xe vm-list is-control-domain=false is-a-snapshot=false params=uuid --minimal | tr ',' ' ')
 
 id=1
 for uuid in $VM_UUID_LIST; do
-    # Coleta dados individuais para precisão
     NAME=$(xe vm-param-get uuid=$uuid param-name=name-label)
     STATE=$(xe vm-param-get uuid=$uuid param-name=power-state)
     VCPUS=$(xe vm-param-get uuid=$uuid param-name=VCPUs-max)
     MEM_BYTES=$(xe vm-param-get uuid=$uuid param-name=memory-static-max)
     MEM_GB=$((MEM_BYTES / 1024 / 1024 / 1024))
     
-    # Calcula tamanho total dos discos virtuais (VBDs)
     DISK_SIZE_BYTES=0
+    DISK_USED_BYTES=0
+    
     VBD_LIST=$(xe vbd-list vm-uuid=$uuid type=Disk params=vdi-uuid --minimal | tr ',' ' ')
     for vdi in $VBD_LIST; do
         if [ -n "$vdi" ]; then
+            # Tamanho Virtual (Alocado)
             SIZE=$(xe vdi-param-get uuid=$vdi param-name=virtual-size 2>/dev/null)
             DISK_SIZE_BYTES=$((DISK_SIZE_BYTES + SIZE))
+            
+            # Tamanho Físico (Usado Real) - ALTERAÇÃO SOLICITADA
+            USED=$(xe vdi-param-get uuid=$vdi param-name=physical-utilisation 2>/dev/null)
+            DISK_USED_BYTES=$((DISK_USED_BYTES + USED))
         fi
     done
     DISK_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
+    USED_GB=$((DISK_USED_BYTES / 1024 / 1024 / 1024))
 
-    # Formata a saída
-    printf "%-3s | %-20s | %-10s | %-2s vCPU/%-2sGB | ~%-3s GB\n" "$id" "${NAME:0:20}" "$STATE" "$VCPUS" "$MEM_GB" "$DISK_GB"
+    # Output formatado com nova coluna
+    printf "%-3s | %-20s | %-8s | %-2s vCPU/%-2sGB | ~%-4s GB    | ~%-4s GB\n" "$id" "${NAME:0:20}" "$STATE" "$VCPUS" "$MEM_GB" "$DISK_GB" "$USED_GB"
     
-    # Salva nos arrays
     UUIDS[$id]=$uuid
     NAMES[$id]=$NAME
     STATES[$id]=$STATE
     ((id++))
 done
 
-echo "---------------------------------------------------------------------------------"
-echo "Legenda HW: C=Cores(CPU), M=Memória RAM"
+echo "--------------------------------------------------------------------------------------------------"
+
+# ALTERAÇÃO SOLICITADA: Cálculo de espaço livre do servidor
+TOTAL_SR_FREE=0
+# Lista apenas SRs do tipo LVM (Discos Locais)
+SR_LVM_LIST=$(xe sr-list type=lvm params=uuid --minimal | tr ',' ' ')
+for sr in $SR_LVM_LIST; do
+    P_SIZE=$(xe sr-param-get uuid=$sr param-name=physical-size 2>/dev/null)
+    P_UTIL=$(xe sr-param-get uuid=$sr param-name=physical-utilisation 2>/dev/null)
+    # Evita erro matemático se vazio
+    if [ -n "$P_SIZE" ] && [ -n "$P_UTIL" ]; then
+        FREE=$((P_SIZE - P_UTIL))
+        TOTAL_SR_FREE=$((TOTAL_SR_FREE + FREE))
+    fi
+done
+TOTAL_FREE_GB=$((TOTAL_SR_FREE / 1024 / 1024 / 1024))
+
+echo "ESPAÇO LIVRE NO SERVIDOR (LVM): ~${TOTAL_FREE_GB} GB"
 echo ""
 
 echo "Digite os números das VMs para backup (Ex: 1 3 4)"
@@ -175,8 +192,9 @@ for vm_id in $selection; do
         echo "    Criando snapshot temporário..."
         SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_WIZARD")
         
-        echo "    Exportando (Isso demora dependendo do tamanho)..."
-        xe vm-export snapshot-uuid=$SNAP_UUID filename="$FILE_NAME"
+        echo "    Exportando (Aguarde)..."
+        # CORREÇÃO CRÍTICA: Trocado 'snapshot-uuid=' por 'vm='
+        xe vm-export vm=$SNAP_UUID filename="$FILE_NAME"
         
         echo "    Limpando snapshot..."
         xe snapshot-uninstall uuid=$SNAP_UUID force=true
@@ -186,7 +204,8 @@ for vm_id in $selection; do
     DURATION=$((END_TIME - START_TIME))
 
     if [ -f "$FILE_NAME" ]; then
-        echo "    [OK] Backup salvo em ${DURATION}s."
+        FSIZE=$(ls -lh "$FILE_NAME" | awk '{print $5}')
+        echo "    [OK] Backup salvo: $FSIZE (Tempo: ${DURATION}s)"
     else
         echo "    [ERRO] Falha ao criar arquivo."
     fi
