@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V4.0 (FIXED)
+# WIZARD DE BACKUP XENSERVER - V5.0
 # ==========================================
 
 MOUNT_POINT="/mnt/usb_backup_wizard"
@@ -57,7 +57,6 @@ if mountpoint -q $MOUNT_POINT; then
     umount $MOUNT_POINT
 fi
 
-# ALTERAÇÃO SOLICITADA: Texto atualizado
 read -p "Deseja FORMATAR este disco para EXT4 AGORA? (Digite 'n' se já formatou) [s/N]: " format_opt
 
 mkdir -p $MOUNT_POINT
@@ -94,7 +93,6 @@ echo ">> Disco pronto (Livre: $FREE_SPACE)"
 # ----------------------------------------
 echo ""
 echo "[3/4] Carregando detalhes das VMs..."
-# ALTERAÇÃO SOLICITADA: Nova coluna USO REAL
 echo "--------------------------------------------------------------------------------------------------"
 printf "%-3s | %-20s | %-8s | %-10s | %-12s | %-12s\n" "ID" "NOME" "STATUS" "HW (C/M)" "DISCO TOTAL" "DISCO EM USO"
 echo "--------------------------------------------------------------------------------------------------"
@@ -119,11 +117,8 @@ for uuid in $VM_UUID_LIST; do
     VBD_LIST=$(xe vbd-list vm-uuid=$uuid type=Disk params=vdi-uuid --minimal | tr ',' ' ')
     for vdi in $VBD_LIST; do
         if [ -n "$vdi" ]; then
-            # Tamanho Virtual (Alocado)
             SIZE=$(xe vdi-param-get uuid=$vdi param-name=virtual-size 2>/dev/null)
             DISK_SIZE_BYTES=$((DISK_SIZE_BYTES + SIZE))
-            
-            # Tamanho Físico (Usado Real) - ALTERAÇÃO SOLICITADA
             USED=$(xe vdi-param-get uuid=$vdi param-name=physical-utilisation 2>/dev/null)
             DISK_USED_BYTES=$((DISK_USED_BYTES + USED))
         fi
@@ -131,7 +126,6 @@ for uuid in $VM_UUID_LIST; do
     DISK_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
     USED_GB=$((DISK_USED_BYTES / 1024 / 1024 / 1024))
 
-    # Output formatado com nova coluna
     printf "%-3s | %-20s | %-8s | %-2s vCPU/%-2sGB | ~%-4s GB    | ~%-4s GB\n" "$id" "${NAME:0:20}" "$STATE" "$VCPUS" "$MEM_GB" "$DISK_GB" "$USED_GB"
     
     UUIDS[$id]=$uuid
@@ -142,14 +136,11 @@ done
 
 echo "--------------------------------------------------------------------------------------------------"
 
-# ALTERAÇÃO SOLICITADA: Cálculo de espaço livre do servidor
 TOTAL_SR_FREE=0
-# Lista apenas SRs do tipo LVM (Discos Locais)
 SR_LVM_LIST=$(xe sr-list type=lvm params=uuid --minimal | tr ',' ' ')
 for sr in $SR_LVM_LIST; do
     P_SIZE=$(xe sr-param-get uuid=$sr param-name=physical-size 2>/dev/null)
     P_UTIL=$(xe sr-param-get uuid=$sr param-name=physical-utilisation 2>/dev/null)
-    # Evita erro matemático se vazio
     if [ -n "$P_SIZE" ] && [ -n "$P_UTIL" ]; then
         FREE=$((P_SIZE - P_UTIL))
         TOTAL_SR_FREE=$((TOTAL_SR_FREE + FREE))
@@ -189,14 +180,20 @@ for vm_id in $selection; do
     if [ "$STATE" == "halted" ]; then
         xe vm-export vm=$UUID filename="$FILE_NAME"
     else
-        echo "    Criando snapshot temporário..."
-        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_WIZARD")
+        echo "    1. Criando snapshot..."
+        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP")
         
-        echo "    Exportando (Aguarde)..."
-        # CORREÇÃO CRÍTICA: Trocado 'snapshot-uuid=' por 'vm='
-        xe vm-export vm=$SNAP_UUID filename="$FILE_NAME"
+        echo "    2. Convertendo snapshot em VM temporária..."
+        # CORREÇÃO CRÍTICA: Clona o snapshot para criar uma VM exportável
+        # Isso contorna o erro 'No matching VMs' e 'Unknown field'
+        TEMP_VM_UUID=$(xe vm-clone uuid=$SNAP_UUID new-name-label="BACKUP_TEMP_VM")
+        xe vm-param-set uuid=$TEMP_VM_UUID is-a-template=false 2>/dev/null
         
-        echo "    Limpando snapshot..."
+        echo "    3. Exportando (Aguarde)..."
+        xe vm-export vm=$TEMP_VM_UUID filename="$FILE_NAME"
+        
+        echo "    4. Limpando..."
+        xe vm-uninstall uuid=$TEMP_VM_UUID force=true
         xe snapshot-uninstall uuid=$SNAP_UUID force=true
     fi
 
