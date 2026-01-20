@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V8.0 (STABLE)
+# WIZARD DE BACKUP XENSERVER - V9.0 (SMART)
 # ==========================================
 
 # Configurações Iniciais
@@ -10,6 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILENAME="backup_log_${DATE_NOW}.txt"
 TEMP_LOG="/tmp/${LOG_FILENAME}"
 
+# Limite de segurança para Snapshot (em GB)
+# Se houver menos que isso livre no SR, o script recomendará desligar a VM
+SNAPSHOT_SAFE_MARGIN=2
+
 # Função de Log
 log_msg() {
     local msg="$1"
@@ -17,31 +21,28 @@ log_msg() {
     echo "[$(date '+%H:%M:%S')] $msg" >> "$TEMP_LOG"
 }
 
-# Função de Monitoramento Melhorada
+# Função de Monitoramento
 monitor_export() {
     local pid=$1
     local file=$2
     local delay=3
     
     echo "    (Monitorando progresso...)"
-    # Loop enquanto o processo existe
     while kill -0 $pid 2>/dev/null; do
         if [ -f "$file" ]; then
-            # Pega tamanho legível
             current_size=$(ls -lh "$file" | awk '{print $5}')
             if [ -n "$current_size" ]; then
-                # Imprime sobrescrevendo a linha atual (\r)
                 printf "    >> Tamanho Atual do Arquivo: %-10s\r" "$current_size"
             fi
         fi
         sleep $delay
     done
-    echo "" # Pula linha ao finalizar
+    echo ""
 }
 
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE BACKUP XENSERVER - V8.0      "
+log_msg "   WIZARD DE BACKUP XENSERVER - V9.0      "
 log_msg "=========================================="
 log_msg "Data: $DATE_NOW"
 
@@ -52,7 +53,6 @@ echo ""
 log_msg "[1/4] Detectando armazenamento..."
 
 > /tmp/disk_list
-
 lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -v "sda" | grep "sd" | while read -r line; do
     echo "$line" >> /tmp/disk_list
 done
@@ -128,19 +128,20 @@ read -p "Deseja DESMONTAR automaticamente ao final? [S/n]: " auto_unmount_opt
 AUTO_UNMOUNT=${auto_unmount_opt:-S}
 log_msg ">> Opção de desmontagem automática: $AUTO_UNMOUNT"
 
-
 # ----------------------------------------
-# 3. LISTAGEM DETALHADA DE VMS
+# 3. ANÁLISE DE VMS E STORAGES
 # ----------------------------------------
 echo ""
-log_msg "[3/4] Carregando detalhes das VMs..."
-echo "--------------------------------------------------------------------------------------------------"
-printf "%-3s | %-20s | %-8s | %-10s | %-12s | %-12s\n" "ID" "NOME" "STATUS" "HW (C/M)" "DISCO TOTAL" "DISCO EM USO"
-echo "--------------------------------------------------------------------------------------------------"
+log_msg "[3/4] Analisando VMs e Viabilidade de Backup..."
+log_msg "Verificando espaço livre nos Storages para permitir snapshots..."
+echo "--------------------------------------------------------------------------------------------------------------------"
+printf "%-3s | %-18s | %-8s | %-12s | %-25s | %-15s\n" "ID" "NOME" "STATUS" "TAM. VM" "STORAGE (LIVRE)" "VIABILIDADE"
+echo "--------------------------------------------------------------------------------------------------------------------"
 
 declare -a UUIDS
 declare -a NAMES
 declare -a STATES
+declare -a VIABILITY
 
 VM_UUID_LIST=$(xe vm-list is-control-domain=false is-a-snapshot=false params=uuid --minimal | tr ',' ' ')
 
@@ -148,49 +149,70 @@ id=1
 for uuid in $VM_UUID_LIST; do
     NAME=$(xe vm-param-get uuid=$uuid param-name=name-label)
     STATE=$(xe vm-param-get uuid=$uuid param-name=power-state)
-    VCPUS=$(xe vm-param-get uuid=$uuid param-name=VCPUs-max)
-    MEM_BYTES=$(xe vm-param-get uuid=$uuid param-name=memory-static-max)
-    MEM_GB=$((MEM_BYTES / 1024 / 1024 / 1024))
     
+    # Tamanho Total da VM
     DISK_SIZE_BYTES=0
-    DISK_USED_BYTES=0
+    # Tenta descobrir o SR do primeiro disco (onde geralmente ocorre o snapshot crítico)
+    SR_NAME="N/A"
+    SR_FREE_GB=0
     
+    # Lista VDIs
     VBD_LIST=$(xe vbd-list vm-uuid=$uuid type=Disk params=vdi-uuid --minimal | tr ',' ' ')
+    FIRST_VDI_CHECKED=false
+    
     for vdi in $VBD_LIST; do
         if [ -n "$vdi" ]; then
             SIZE=$(xe vdi-param-get uuid=$vdi param-name=virtual-size 2>/dev/null)
             DISK_SIZE_BYTES=$((DISK_SIZE_BYTES + SIZE))
-            USED=$(xe vdi-param-get uuid=$vdi param-name=physical-utilisation 2>/dev/null)
-            DISK_USED_BYTES=$((DISK_USED_BYTES + USED))
+            
+            # Pega info do SR apenas do primeiro disco para exibir na tabela
+            if [ "$FIRST_VDI_CHECKED" = false ]; then
+                SR_UUID=$(xe vdi-param-get uuid=$vdi param-name=sr-uuid 2>/dev/null)
+                if [ -n "$SR_UUID" ]; then
+                    SR_NAME_RAW=$(xe sr-param-get uuid=$SR_UUID param-name=name-label 2>/dev/null)
+                    SR_NAME="${SR_NAME_RAW:0:15}" # Corta nome longo
+                    
+                    # Calcula espaço livre deste SR
+                    P_SIZE=$(xe sr-param-get uuid=$SR_UUID param-name=physical-size 2>/dev/null)
+                    P_UTIL=$(xe sr-param-get uuid=$SR_UUID param-name=physical-utilisation 2>/dev/null)
+                    if [ -n "$P_SIZE" ] && [ -n "$P_UTIL" ]; then
+                         FREE_BYTES=$((P_SIZE - P_UTIL))
+                         SR_FREE_GB=$((FREE_BYTES / 1024 / 1024 / 1024))
+                    fi
+                fi
+                FIRST_VDI_CHECKED=true
+            fi
         fi
     done
     DISK_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
-    USED_GB=$((DISK_USED_BYTES / 1024 / 1024 / 1024))
 
-    printf "%-3s | %-20s | %-8s | %-2s vCPU/%-2sGB | ~%-4s GB    | ~%-4s GB\n" "$id" "${NAME:0:20}" "$STATE" "$VCPUS" "$MEM_GB" "$DISK_GB" "$USED_GB"
+    # Lógica de Viabilidade
+    MSG_VIAVEL="ERRO"
+    IS_VIABLE=true
+    
+    if [ "$STATE" == "halted" ]; then
+        MSG_VIAVEL="OK (DIRETO)"
+    else
+        # Se estiver ligada, precisa de espaço para snapshot
+        if [ "$SR_FREE_GB" -lt "$SNAPSHOT_SAFE_MARGIN" ]; then
+            MSG_VIAVEL="REQ. DESLIGAR"
+            IS_VIABLE=false # Marca como arriscado
+        else
+            MSG_VIAVEL="OK (SNAPSHOT)"
+        fi
+    fi
+
+    printf "%-3s | %-18s | %-8s | ~%-4s GB    | %-15s (~%3sGB) | %-15s\n" "$id" "${NAME:0:18}" "$STATE" "$DISK_GB" "$SR_NAME" "$SR_FREE_GB" "$MSG_VIAVEL"
     
     UUIDS[$id]=$uuid
     NAMES[$id]=$NAME
     STATES[$id]=$STATE
+    VIABILITY[$id]=$IS_VIABLE
     ((id++))
 done
 
-echo "--------------------------------------------------------------------------------------------------"
-
-TOTAL_SR_FREE=0
-SR_LVM_LIST=$(xe sr-list type=lvm params=uuid --minimal | tr ',' ' ')
-for sr in $SR_LVM_LIST; do
-    P_SIZE=$(xe sr-param-get uuid=$sr param-name=physical-size 2>/dev/null)
-    P_UTIL=$(xe sr-param-get uuid=$sr param-name=physical-utilisation 2>/dev/null)
-    if [ -n "$P_SIZE" ] && [ -n "$P_UTIL" ]; then
-        FREE=$((P_SIZE - P_UTIL))
-        TOTAL_SR_FREE=$((TOTAL_SR_FREE + FREE))
-    fi
-done
-TOTAL_FREE_GB=$((TOTAL_SR_FREE / 1024 / 1024 / 1024))
-
-log_msg "ESPAÇO LIVRE NO SERVIDOR (Soma de todos SRs): ~${TOTAL_FREE_GB} GB"
-log_msg "NOTA: Se um Storage específico estiver cheio, o backup falhará mesmo sobrando espaço em outro."
+echo "--------------------------------------------------------------------------------------------------------------------"
+log_msg "NOTA: 'REQ. DESLIGAR' significa que o storage está muito cheio para backup a quente."
 echo ""
 
 echo "Digite os números das VMs para backup (Ex: 1 3 4)"
@@ -210,9 +232,9 @@ for vm_id in $selection; do
     UUID=${UUIDS[$vm_id]}
     VM_NAME=${NAMES[$vm_id]}
     STATE=${STATES[$vm_id]}
+    IS_VIABLE=${VIABILITY[$vm_id]}
     
     if [ -z "$UUID" ]; then
-        log_msg ">> ID $vm_id inválido. Pulando."
         continue
     fi
 
@@ -222,26 +244,31 @@ for vm_id in $selection; do
     log_msg "------------------------------------------------"
     log_msg ">>> Processando: $VM_NAME ($STATE)"
     
+    # Aviso de risco se o usuário tentar fazer backup de VM sem espaço
+    if [ "$STATE" == "running" ] && [ "$IS_VIABLE" = false ]; then
+        log_msg "    [ALERTA] Storage quase cheio! Tentativa de snapshot pode falhar."
+        log_msg "    Recomendação: Cancele e desligue a VM antes de tentar."
+        log_msg "    Tentando mesmo assim em 3 segundos..."
+        sleep 3
+    fi
+    
     START_TIME=$(date +%s)
     EXPORT_ERROR=0
 
     if [ "$STATE" == "halted" ]; then
-        log_msg "    Modo: Exportação Direta (Desligada)"
+        log_msg "    Modo: Exportação Direta (Seguro para disco cheio)"
         xe vm-export vm=$UUID filename="$FILE_NAME" >> "$TEMP_LOG" 2>&1 &
         EXPORT_PID=$!
         monitor_export $EXPORT_PID "$FILE_NAME"
         wait $EXPORT_PID || EXPORT_ERROR=1
     else
         log_msg "    1. Criando snapshot temporário..."
-        # Tenta criar snapshot. Se falhar, captura erro
         SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP" 2>&1)
         SNAP_RET=$?
         
-        # Verifica se o UUID retornado é válido (sem espaços, erros) e se o comando deu certo
         if [ $SNAP_RET -ne 0 ] || [[ "$SNAP_UUID" == *"Error"* ]]; then
-            log_msg "    [ERRO CRÍTICO] Falha ao criar snapshot!"
-            log_msg "    Motivo provável: Disco do Servidor (Storage Repository) cheio."
-            log_msg "    Detalhe: $SNAP_UUID"
+            log_msg "    [ERRO CRÍTICO] Falha ao criar snapshot (Storage Cheio?)."
+            log_msg "    Ação: Desligue a VM e tente novamente."
             ((FAIL_COUNT++))
             continue
         fi
@@ -296,7 +323,5 @@ if [[ "$AUTO_UNMOUNT" =~ ^[sS]$ ]]; then
 else
     echo ""
     log_msg "AVISO: O disco PERMANECE MONTADO (Opção do usuário)."
-    log_msg "Local: $MOUNT_POINT"
-    echo "Conteúdo atual:"
     ls -lh "$MOUNT_POINT"
 fi
