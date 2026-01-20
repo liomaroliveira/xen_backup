@@ -1,10 +1,11 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - MODO TEXTO
+# WIZARD DE BACKUP XENSERVER - V2.0 (CORRIGIDO)
 # ==========================================
 
 MOUNT_POINT="/mnt/usb_backup_wizard"
 DATE_NOW=$(date +%Y-%m-%d)
+TMP_LIST="/tmp/vm_list.csv"
 
 clear
 echo "=========================================="
@@ -17,12 +18,17 @@ echo "=========================================="
 echo ""
 echo "[1/4] Detectando discos disponíveis (ignorando disco do sistema)..."
 echo "----------------------------------------------------------------"
+
+# Limpa lista anterior
+> /tmp/disk_list
+
 # Lista discos sd* excluindo o sda (sistema)
-lsblk -d -n -o NAME,SIZE,MODEL | grep -v "sda" | grep "sd" | awk '{print "/dev/"$1 " - Tamanho: " $2 " - " $3}' > /tmp/disk_list
+lsblk -d -n -o NAME,SIZE,MODEL,TRAN | grep -v "sda" | grep "sd" | while read -r line; do
+    echo "$line" >> /tmp/disk_list
+done
 
 if [ ! -s /tmp/disk_list ]; then
     echo "ERRO: Nenhum disco USB detectado (apenas sda encontrado)."
-    echo "Conecte o HD externo e rode o script novamente."
     exit 1
 fi
 
@@ -37,9 +43,10 @@ done
 echo ""
 read -p "Escolha o NÚMERO do HD Externo: " disk_opt
 selected_disk_info="${DISKS[$((disk_opt-1))]}"
-USB_DEVICE=$(echo "$selected_disk_info" | awk '{print $1}')
+USB_DEVICE_NAME=$(echo "$selected_disk_info" | awk '{print $1}')
+USB_DEVICE="/dev/$USB_DEVICE_NAME"
 
-if [ -z "$USB_DEVICE" ]; then
+if [ -z "$USB_DEVICE_NAME" ]; then
     echo "Opção inválida. Saindo."
     exit 1
 fi
@@ -48,154 +55,141 @@ echo ">> Você selecionou: $USB_DEVICE"
 echo ""
 
 # ----------------------------------------
-# 2. FORMATAÇÃO E MONTAGEM
+# 2. MONTAGEM (COM OU SEM FORMATAÇÃO)
 # ----------------------------------------
 echo "[2/4] Configuração de Arquivos"
-read -p "Deseja FORMATAR este disco para ext4 (Recomendado para velocidade)? [s/N]: " format_opt
+# Verifica se já está montado para evitar erro
+if mountpoint -q $MOUNT_POINT; then
+    umount $MOUNT_POINT
+fi
 
-# Prepara ponto de montagem
+read -p "Deseja FORMATAR este disco AGORA? (Digite 'n' se já formatou antes) [s/N]: " format_opt
+
 mkdir -p $MOUNT_POINT
-# Garante que nada está montado lá
-umount $MOUNT_POINT 2>/dev/null
 
 if [[ "$format_opt" =~ ^[sS]$ ]]; then
     echo "!!! ATENÇÃO: TODOS OS DADOS EM $USB_DEVICE SERÃO APAGADOS !!!"
     read -p "Tem certeza absoluta? Digite 'SIM' para confirmar: " confirm
     if [ "$confirm" == "SIM" ]; then
-        echo "Formatando (pode demorar alguns segundos)..."
+        echo "Formatando..."
         mkfs.ext4 -F "$USB_DEVICE" > /dev/null 2>&1
         mount "$USB_DEVICE" $MOUNT_POINT
     else
-        echo "Formatação cancelada. Tentando montar como está..."
-        mount "$USB_DEVICE" $MOUNT_POINT
+        echo "Cancelado."
+        exit 0
     fi
 else
-    echo "Tentando montar partição existente..."
-    # Tenta montar a partição 1 (comum em HDs windows) ou o disco inteiro
+    echo "Montando disco existente..."
+    # Tenta montar sde1, se falhar tenta sde
     if [ -b "${USB_DEVICE}1" ]; then
-        mount "${USB_DEVICE}1" $MOUNT_POINT
+        mount "${USB_DEVICE}1" $MOUNT_POINT 2>/dev/null || mount "$USB_DEVICE" $MOUNT_POINT
     else
         mount "$USB_DEVICE" $MOUNT_POINT
     fi
 fi
 
-# Verifica se montou
+# Verificação final de montagem
 if ! mountpoint -q $MOUNT_POINT; then
-    echo "ERRO: Não foi possível montar o disco. Se for NTFS, o XenServer pode não ter driver de escrita."
-    echo "Recomendo rodar novamente e escolher a opção de FORMATAR para ext4."
+    echo "ERRO CRÍTICO: Não foi possível montar o disco."
+    echo "Se você acabou de formatar, tente remover e inserir o USB novamente."
     exit 1
 fi
 
 FREE_SPACE=$(df -h $MOUNT_POINT | awk 'NR==2 {print $4}')
-echo ">> Sucesso! Disco montado em $MOUNT_POINT (Livre: $FREE_SPACE)"
+echo ">> Sucesso! Disco montado (Livre: $FREE_SPACE)"
 
 # ----------------------------------------
-# 3. SELEÇÃO DE VMS
+# 3. SELEÇÃO DE VMS (MÉTODO SEGURO)
 # ----------------------------------------
 echo ""
 echo "[3/4] Listando Máquinas Virtuais..."
 echo "----------------------------------------------------------------"
-
-# Obtém lista de VMs (UUID e Nome) - Ignora Control Domain e Templates
-xe vm-list is-control-domain=false is-a-snapshot=false params=uuid,name-label,power-state --minimal | tr ',' ' ' > /tmp/vm_raw_list
-
-# Cria arrays para menu
-declare -a VM_UUIDS
-declare -a VM_NAMES
-declare -a VM_STATES
-
-i=1
-# O comando xe vm-list separator é ruim de parsear com espaços no nome.
-# Vamos usar um loop forçado linha a linha
-xe vm-list is-control-domain=false is-a-snapshot=false params=name-label,power-state,uuid | grep -v "^$" | paste - - - | while read -r line; do
-    # Formatação visual simples
-    echo "$line" >> /tmp/vm_list_formatted
-done
-
-# Recarrega lista formatada para exibir e selecionar
-# Devido à complexidade do Bash antigo do Xen, faremos uma iteração visual
 echo "ID  | ESTADO    | NOME DA VM"
 echo "--- | --------- | ------------------------"
+
+# Obtém lista limpa separada por vírgulas: uuid,name-label,power-state
+xe vm-list is-control-domain=false is-a-snapshot=false params=uuid,name-label,power-state --minimal > $TMP_LIST
+
+# Arrays para armazenar dados
+declare -a UUIDS
+declare -a NAMES
+declare -a STATES
+
 id=1
-# Arquivo temporário para guardar mapeamento ID -> UUID
-> /tmp/vm_map
-
-IFS=$'\n'
-for vm in $(xe vm-list is-control-domain=false is-a-snapshot=false params=uuid,power-state,name-label | grep "uuid" -A 2 | grep -v "^--$"); do
-    # Logica simplificada: captura blocos de 3 linhas
-    # Mas para o script ser robusto no XenServer CLI, vamos usar uuid direto
-    pass
-done
-
-# Método robusto de listagem
-xe vm-list is-control-domain=false is-a-snapshot=false params=uuid,power-state,name-label | paste - - - | awk '{printf "%3d | %-9s | %s %s %s %s\n", NR, $4, $6, $7, $8, $9}' > /tmp/menu_display
-xe vm-list is-control-domain=false is-a-snapshot=false params=uuid --minimal | tr ',' '\n' > /tmp/uuid_list
-
-cat /tmp/menu_display
+# Lê o arquivo CSV gerado pelo XenServer
+# IFS=, define a vírgula como separador
+while IFS=, read -r uuid name state; do
+    # Remove aspas se houver
+    name=$(echo $name | sed 's/"//g')
+    
+    printf "%-3s | %-9s | %s\n" "$id" "$state" "$name"
+    
+    UUIDS[$id]=$uuid
+    NAMES[$id]=$name
+    STATES[$id]=$state
+    ((id++))
+done < $TMP_LIST
 
 echo ""
-echo "Digite os números das VMs para backup separados por espaço."
-echo "Exemplo: 1 3 4 (Para fazer backup da primeira, terceira e quarta)"
+echo "Digite os números das VMs para backup separados por espaço (Ex: 1 3 4)"
 read -p "Seleção: " selection
 
 # ----------------------------------------
-# 4. EXECUÇÃO DO BACKUP (O LOOP MÁGICO)
+# 4. EXECUÇÃO DO BACKUP
 # ----------------------------------------
 echo ""
-echo "[4/4] Iniciando Processo de Backup em Lote..."
-echo "Aviso: Não feche esta janela."
+echo "[4/4] Iniciando Processo de Backup..."
 
-for id in $selection; do
-    # Pega o UUID correspondente à linha escolhida
-    UUID=$(sed -n "${id}p" /tmp/uuid_list)
+for vm_id in $selection; do
+    UUID=${UUIDS[$vm_id]}
+    VM_NAME=${NAMES[$vm_id]}
+    STATE=${STATES[$vm_id]}
     
     if [ -z "$UUID" ]; then
-        echo "ID $id inválido, pulando..."
+        echo ">> ID $vm_id inválido, pulando..."
         continue
     fi
 
-    VM_NAME=$(xe vm-list uuid=$UUID params=name-label --minimal)
-    STATE=$(xe vm-list uuid=$UUID params=power-state --minimal)
-    FILE_NAME="${MOUNT_POINT}/${VM_NAME// /_}_${DATE_NOW}.xva"
+    # Limpa nome do arquivo (remove espaços e caracteres estranhos)
+    SAFE_NAME=$(echo "$VM_NAME" | tr -d '[:cntrl:]' | tr -s ' ' '_' | tr -cd '[:alnum:]_.-')
+    FILE_NAME="${MOUNT_POINT}/${SAFE_NAME}_${DATE_NOW}.xva"
 
-    echo ""
-    echo ">>> Processando: $VM_NAME (Estado: $STATE)"
-    echo "    UUID: $UUID"
-
+    echo "-------------------------------------------------------"
+    echo "Processando: $VM_NAME"
+    echo "Estado Atual: $STATE"
+    
     START_TIME=$(date +%s)
 
     if [ "$STATE" == "halted" ]; then
-        # MODO DESLIGADO (Direto e Rápido)
-        echo "    Modo: Exportação Direta (VM Desligada)"
+        echo ">> Exportando VM Desligada (Modo Rápido)..."
         xe vm-export vm=$UUID filename="$FILE_NAME"
     else
-        # MODO LIGADO (Snapshot -> Export -> Delete)
-        echo "    Modo: Snapshot a Quente (VM Ligada)"
-        echo "    1. Criando Snapshot temporário..."
-        # Cria snapshot e captura o UUID dele
-        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_${VM_NAME}")
+        echo ">> VM Ligada detectada. Usando Snapshot temporário..."
+        echo "   1. Criando snapshot..."
+        SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_WIZARD")
         
-        echo "    2. Exportando Snapshot para USB..."
+        echo "   2. Exportando snapshot..."
         xe vm-export snapshot-uuid=$SNAP_UUID filename="$FILE_NAME"
         
-        echo "    3. Removendo Snapshot temporário..."
+        echo "   3. Deletando snapshot..."
         xe snapshot-uninstall uuid=$SNAP_UUID force=true
     fi
 
     END_TIME=$(date +%s)
     DURATION=$((END_TIME - START_TIME))
-    
+
     if [ -f "$FILE_NAME" ]; then
-        SIZE=$(ls -lh "$FILE_NAME" | awk '{print $5}')
-        echo "    [SUCESSO] Backup concluído em ${DURATION}s. Tamanho: $SIZE"
+        FSIZE=$(ls -lh "$FILE_NAME" | awk '{print $5}')
+        echo ">> SUCESSO! Arquivo criado: $SAFE_NAME.xva ($FSIZE)"
+        echo ">> Tempo total: ${DURATION} segundos"
     else
-        echo "    [ERRO] O arquivo não foi gerado."
+        echo ">> ERRO: O arquivo de backup não foi criado."
     fi
 done
 
 echo ""
 echo "=========================================="
-echo "TODAS AS TAREFAS CONCLUÍDAS."
+echo "Tarefas concluídas."
 echo "Desmontando USB..."
 umount $MOUNT_POINT
-echo "Pode remover o disco com segurança."
+echo "Pode remover o disco."
