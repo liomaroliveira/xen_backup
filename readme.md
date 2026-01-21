@@ -1,113 +1,100 @@
 # Ferramentas de Gerenciamento XenServer para USB
 
-Este repositório contém dois scripts essenciais para administração, backup e documentação de ambientes Citrix XenServer legados, com suporte a exportação direta para USB.
+Este repositório contém scripts robustos para administração, backup e documentação de ambientes Citrix XenServer legados, com foco em resiliência e exportação direta para discos USB.
 
 ## Scripts Disponíveis
 
-1.  **`wizard_backup.sh` (v6.0)**: Realiza backup completo (arquivo `.xva`) das VMs.
-2.  **`wizard_audit.sh` (v1.0)**: Extrai 100% das informações técnicas e metadados de cada VM para arquivos de texto.
+1.  **`wizard_backup.sh` (v12.0)**: Realiza backup completo (`.xva`) das VMs. Inclui monitoramento em tempo real, auto-recuperação de falhas e gestão inteligente de espaço.
+2.  **`wizard_audit.sh` (v2.0)**: Extrai 100% das informações técnicas (Host + VMs) para arquivos de texto.
 
 ---
 
 ## 1. Wizard de Backup (`wizard_backup.sh`)
 
-Script automatizado para realizar backup de Máquinas Virtuais (VMs) diretamente para um HD Externo USB.
+Script automatizado para backup de VMs diretamente para HD Externo. Projetado para lidar com falhas de storage, interrupções (Ctrl+C) e tarefas travadas.
 
-### Funcionalidades
-- **Hot Backup:** Realiza backup de VMs ligadas (Running) usando estratégia de Clone Temporário.
-- **Wizard Interativo:** Guia passo a passo para montagem e formatação.
-- **Logs Duplos:** Salva logs no servidor e no HD externo.
+### Funcionalidades Principais
+-   **Auto-Healing (Auto-Cura):** Detecta e remove resíduos de backups falhos (`BACKUP_TEMP_VM`) automaticamente ao iniciar.
+-   **Safe Destroy:** Utiliza método seguro de limpeza que evita o aviso crítico de "Shared Disk", garantindo que o disco original nunca seja tocado.
+-   **Modo Híbrido Inteligente:**
+    -   Se o Storage tiver espaço: Faz backup a quente (Snapshot).
+    -   Se o Storage estiver cheio: Detecta o erro e oferece desligar a VM temporariamente para fazer o backup a frio (Shutdown -> Export -> Start).
+-   **Destravamento de Toolstack:** Detecta se o XenServer está travado com tarefas pendentes (zumbis) e oferece reiniciar a Toolstack (`xe-toolstack-restart`) automaticamente.
+-   **Monitoramento em Tempo Real:** Exibe o crescimento do arquivo de backup durante a exportação.
 
 ### Como Usar
 1.  Conecte o HD Externo.
-2.  Execute:
+2.  Inicie uma sessão `screen` (recomendado):
+    
+    screen -S backup
+
+3.  Execute o script:
     
     ./wizard_backup.sh
 
-3.  Siga as instruções na tela para selecionar o disco e as VMs.
+4.  **Fluxo do Wizard:**
+    -   **Auto-Check:** Se houver lixo de execução anterior, ele pedirá para limpar.
+    -   **Montagem:** Selecione o disco. O script desmonta automaticamente se o disco estiver "busy".
+    -   **Seleção:** Uma tabela exibirá a saúde de cada VM.
+        -   *Status "REQ. DESLIGAR":* Significa que o storage está muito cheio para snapshot.
+    -   **Execução:** Acompanhe o progresso. Se um snapshot falhar, o script perguntará se você deseja tentar o método de desligamento.
 
 ---
 
 ## 2. Wizard de Auditoria (`wizard_audit.sh`)
 
-Script focado em documentação. Ele varre todas as VMs do servidor e gera um relatório técnico exaustivo ("dump" de configurações) para cada uma.
+Script de documentação técnica profunda. Gera um "Raio-X" do servidor e das máquinas virtuais.
 
 ### O que ele extrai?
-Para cada VM, ele cria um arquivo `.txt` contendo:
-- **Resumo Geral:** Nome, descrição, vCPUs, RAM.
-- **vm-param-list:** A lista completa de parâmetros internos do Xen (BIOS strings, platform settings, PV-args).
-- **Discos (VBDs/VDIs):** Detalhes técnicos de cada disco virtual, incluindo UUIDs, flags de boot e local físico.
-- **Rede (VIFs):** Endereços MAC, redes conectadas, limites de banda e QoS.
-- **Snapshots:** Lista de snapshots vinculados àquela VM.
+Cria uma pasta datada (ex: `AUDITORIA_2026-01-21`) contendo:
+-   **Dados do Host Físico:** CPU, Versão, Patches instalados, Placas de Rede (PIFs).
+-   **Dados das VMs:** Parâmetros de boot, BIOS strings, UUIDs.
+-   **Discos e Rede:** Detalhes de VBDs (Discos virtuais) e VIFs (Interfaces virtuais, MACs).
 
 ### Como Usar
-1.  Conecte o HD Externo.
-2.  Execute:
+1.  Execute:
     
     ./wizard_audit.sh
 
-3.  O script criará uma pasta datada (ex: `AUDITORIA_2026-01-20_18-00`) no HD externo contendo um arquivo por VM.
+2.  Ao final, você pode escolher **manter o disco montado** para conferir os arquivos antes de remover.
 
 ---
 
-## Detalhes Técnicos e Agendamento
+## Detalhes Técnicos
 
-### Montagem de Disco
-Ambos os scripts utilizam o diretório `/mnt` como ponto de montagem temporário:
-- Backup: `/mnt/usb_backup_wizard`
-- Auditoria: `/mnt/usb_audit_wizard`
+### Estratégia de Backup (Hot vs Cold)
+O script decide dinamicamente a melhor estratégia:
 
-### Automação no Crontab
-Os scripts padrão são interativos. Para agendar no `cron`, você deve criar cópias removendo os comandos `read -p` e definindo as variáveis estáticas no início do arquivo.
+1.  **VMs Desligadas (Cold):** Usa `xe vm-export` direto. Seguro e não consome espaço extra no storage.
+2.  **VMs Ligadas (Hot - Snapshot):**
+    -   Cria Snapshot -> Clona para VM Temporária -> Exporta -> Destrói.
+    -   *Nota:* Requer espaço livre no Storage Repository (SR) igual ao tamanho das mudanças no disco.
+3.  **Fallback (Recuperação):** Se o Snapshot falhar (Erro `SR_BACKEND_FAILURE`), o script captura o erro e permite alternar para o modo Cold (Desligar/Ligar) na mesma hora.
 
-**Exemplo de adaptação para Cron:**
+### Correção de "Shared Disk Warning"
+Nas versões antigas, o comando `vm-uninstall` gerava alertas assustadores sobre discos compartilhados. A versão V11+ utiliza `xe vm-destroy` para remover apenas o registro da VM temporária e `xe snapshot-uninstall` para limpar os dados, eliminando qualquer risco aos discos originais.
 
-    # Defina isso no topo do script modificado
-    USB_DEVICE="/dev/sdb1"
-    MOUNT_POINT="/mnt/usb_backup_wizard"
-    # Remova as partes de detecção automática e perguntas
-
-**Linha do Crontab (Exemplo para rodar todo Domingo às 03:00):**
-
-    0 3 * * 0 /root/scripts/auto_audit.sh >> /var/log/xen_audit.log 2>&1
-
-### Estrutura de Logs
-Os logs de execução são salvos automaticamente na raiz do diretório criado no USB e também ficam temporariamente em `/tmp/` durante a execução.
-
-- Formato do Log de Backup: `backup_log_DATA.txt`
-- Formato do Log de Auditoria: `audit_log_DATA.txt`
+### Logs e Auditoria
+-   Todos os passos são registrados em log duplo (gravado no servidor em `/tmp` e no USB).
+-   Se o script for interrompido (`Ctrl+C`), ele intercepta o sinal e tenta desmontar o disco com segurança.
 
 ---
 
-## Proteção contra Quedas de Conexão (Screen)
+## Proteção e Agendamento
 
-Como o processo de backup de VMs grandes pode demorar horas, é altamente recomendável rodar os scripts dentro de uma sessão **Screen**. Isso garante que o backup continue rodando no servidor mesmo que sua internet caia ou seu computador desligue.
-
-### Instalação
-Caso o comando `screen` não exista:
+### Proteção contra Quedas (Screen)
+Como backups podem demorar horas, sempre execute dentro do `screen`:
 
     yum install screen
-
-### Passo a Passo Seguro
-
-1. **Inicie uma sessão persistente:**
-   Antes de rodar o script, crie a sessão:
-   
     screen -S backup_session
-
-2. **Execute o script dentro dela:**
-   
     ./wizard_backup.sh
 
-3. **Para sair e deixar rodando (Detach):**
-   Se precisar desligar seu computador ou fechar o SSH:
-   - Pressione `Ctrl + A` (e solte).
-   - Pressione `D`.
-   - *O terminal voltará para o shell normal, mas o script continua rodando no fundo.*
+-   **Sair e deixar rodando:** Pressione `Ctrl+A`, depois `D`.
+-   **Voltar:** `screen -r backup_session`
 
-4. **Para voltar e conferir (Reattach):**
-   Ao acessar o servidor novamente:
-   
-    screen -r backup_session
+### Automação (Cron)
+Para agendar, crie uma cópia do script (`auto_backup.sh`), remova as perguntas interativas (`read -p`) e defina as variáveis no topo:
 
-   - *Se a sessão parecer "travada" ou "morta", use `screen -d -r` para forçar a reconexão.*
+    USB_DEVICE="/dev/sdb1"
+    SELECTION_UUIDS="uuid1 uuid2"
+    AUTO_UNMOUNT="S"
