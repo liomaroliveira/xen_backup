@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V11.0 (SAFE DESTROY)
+# WIZARD DE BACKUP XENSERVER - V12.0 (ANTI-FREEZE)
 # ==========================================
 
 # Configurações Iniciais
@@ -9,7 +9,7 @@ DATE_NOW=$(date +%Y-%m-%d_%H-%M)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILENAME="backup_log_${DATE_NOW}.txt"
 TEMP_LOG="/tmp/${LOG_FILENAME}"
-SNAPSHOT_SAFE_MARGIN=5  # Margem de segurança em GB
+SNAPSHOT_SAFE_MARGIN=5
 
 # Trap para Ctrl+C
 trap ctrl_c INT
@@ -29,18 +29,14 @@ log_msg() {
     echo "[$(date '+%H:%M:%S')] $msg" >> "$TEMP_LOG"
 }
 
-# Função de Limpeza Segura (A MUDANÇA CRÍTICA)
+# Função de Limpeza Segura
 safe_cleanup() {
     local vm_uuid=$1
     local snap_uuid=$2
-    
-    # 1. Destrói o registro da VM Temporária (NÃO TOCA EM DISCO)
     if [ -n "$vm_uuid" ]; then
-        log_msg "    Removendo registro da VM Temp (Metadata)..."
+        log_msg "    Removendo registro da VM Temp..."
         xe vm-destroy uuid=$vm_uuid >> "$TEMP_LOG" 2>&1
     fi
-    
-    # 2. Remove o Snapshot (Isso libera o espaço de forma segura)
     if [ -n "$snap_uuid" ]; then
         log_msg "    Removendo Snapshot..."
         xe snapshot-uninstall uuid=$snap_uuid force=true >> "$TEMP_LOG" 2>&1
@@ -67,15 +63,36 @@ monitor_export() {
 
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE BACKUP XENSERVER - V11.0     "
+log_msg "   WIZARD DE BACKUP XENSERVER - V12.0     "
 log_msg "=========================================="
 log_msg "Data: $DATE_NOW"
 
 # ----------------------------------------
-# 0. ROTINA DE AUTO-LIMPEZA SEGURA
+# 0. AUTO-DIAGNÓSTICO E LIMPEZA
 # ----------------------------------------
-log_msg "[0/4] Verificando ambiente..."
+log_msg "[0/4] Verificando saúde do XenServer..."
 
+# 1. Checagem de Tarefas Travadas (IMPLEMENTAÇÃO SOLICITADA)
+PENDING_TASKS=$(xe task-list status=pending params=uuid --minimal)
+
+if [ -n "$PENDING_TASKS" ]; then
+    log_msg "[ALERTA] Detectadas tarefas travadas/pendentes na Toolstack."
+    log_msg "Isso pode impedir a limpeza de VMs antigas."
+    read -p "Deseja reiniciar a Toolstack (XAPI) para destravar? [S/n]: " toolstack_opt
+    toolstack_opt=${toolstack_opt:-S}
+    
+    if [[ "$toolstack_opt" =~ ^[sS]$ ]]; then
+        log_msg "Reiniciando Toolstack (Isso não desliga as VMs)..."
+        xe-toolstack-restart
+        log_msg "Aguardando 10 segundos para estabilização..."
+        sleep 10
+        log_msg "Toolstack reiniciada."
+    else
+        log_msg "Pulando reinício da Toolstack (Risco de travamento mantido)."
+    fi
+fi
+
+# 2. Limpeza de Órfãos
 ORPHAN_VMS=$(xe vm-list name-label="BACKUP_TEMP_VM" params=uuid --minimal)
 ORPHAN_SNAPS=$(xe snapshot-list name-label="BACKUP_TEMP_SNAP" params=uuid --minimal)
 
@@ -84,14 +101,8 @@ if [ -n "$ORPHAN_VMS" ] || [ -n "$ORPHAN_SNAPS" ]; then
     read -p "Deseja limpar resíduos agora? [S/n]: " clean_opt
     clean_opt=${clean_opt:-S}
     if [[ "$clean_opt" =~ ^[sS]$ ]]; then
-        # Limpa VMs usando vm-destroy (seguro)
-        for u in ${ORPHAN_VMS//,/ }; do 
-            safe_cleanup "$u" ""
-        done
-        # Limpa Snapshots
-        for u in ${ORPHAN_SNAPS//,/ }; do 
-            safe_cleanup "" "$u"
-        done
+        for u in ${ORPHAN_VMS//,/ }; do safe_cleanup "$u" ""; done
+        for u in ${ORPHAN_SNAPS//,/ }; do safe_cleanup "" "$u"; done
         log_msg "Limpeza concluída."
     fi
 fi
@@ -138,10 +149,10 @@ echo ""
 # ----------------------------------------
 log_msg "[2/4] Configuração de Montagem"
 
+# Desmonta se já estiver montado em outro lugar
 CURRENT_MOUNT=$(lsblk -n -o MOUNTPOINT $USB_DEVICE | head -n 1)
 if [ -n "$CURRENT_MOUNT" ]; then
     log_msg "AVISO: Dispositivo já montado em: $CURRENT_MOUNT"
-    log_msg "Desmontando para evitar conflitos..."
     umount -l $USB_DEVICE 2>/dev/null
     umount -l $CURRENT_MOUNT 2>/dev/null
 fi
@@ -209,7 +220,6 @@ for uuid in $VM_UUID_LIST; do
     
     STATE=$(xe vm-param-get uuid=$uuid param-name=power-state)
     
-    # Tamanho e Storage
     DISK_SIZE_BYTES=0
     SR_NAME="N/A"
     SR_FREE_GB=0
@@ -289,9 +299,8 @@ for vm_id in $selection; do
     log_msg "------------------------------------------------"
     log_msg ">>> Processando: $VM_NAME ($STATE)"
     
-    # Validação de espaço
     if [ "$STATE" == "running" ] && [ "$IS_VIABLE" = false ]; then
-        log_msg "    [ALERTA] Storage cheio. Snapshot arriscado."
+        log_msg "    [ALERTA] Storage cheio."
         read -p "    Deseja DESLIGAR a VM para backup seguro? [y/N]: " shut_opt
         if [[ "$shut_opt" =~ ^[yY]$ ]]; then
             FORCE_SHUTDOWN=true
@@ -312,7 +321,6 @@ for vm_id in $selection; do
             log_msg "    1. Desligando VM..."
             xe vm-shutdown uuid=$UUID
             sleep 2
-            # Garante Force se travar
             if [ "$(xe vm-param-get uuid=$UUID param-name=power-state)" != "halted" ]; then
                 xe vm-shutdown uuid=$UUID force=true
             fi
@@ -330,7 +338,7 @@ for vm_id in $selection; do
         fi
 
     else
-        # MODO ONLINE (SNAPSHOT)
+        # MODO ONLINE
         log_msg "    1. Criando snapshot..."
         SNAP_UUID=$(xe vm-snapshot uuid=$UUID new-name-label="BACKUP_TEMP_SNAP" 2>&1)
         SNAP_RET=$?
@@ -362,7 +370,6 @@ for vm_id in $selection; do
             wait $EXPORT_PID || EXPORT_ERROR=1
             
             log_msg "    4. Limpando..."
-            # USO DA FUNÇÃO SEGURA
             safe_cleanup "$TEMP_VM_UUID" "$SNAP_UUID"
         fi
     fi
