@@ -1,99 +1,97 @@
-# Ferramentas de Gerenciamento XenServer para USB
+# Ferramentas de Migração e Gerenciamento: XenServer -> Proxmox
 
-Este repositório contém scripts robustos para administração, backup e documentação de ambientes Citrix XenServer legados, com foco em resiliência e exportação direta para discos USB.
+Este repositório contém uma suíte completa de scripts para administrar, realizar backup, auditar e **migrar** ambientes Citrix XenServer legados para Proxmox VE, com foco em segurança de dados e integridade de rede.
 
 ## Scripts Disponíveis
 
-1.  **`wizard_backup.sh` (v12.0)**: Realiza backup completo (`.xva`) das VMs. Inclui monitoramento em tempo real, auto-recuperação de falhas e gestão inteligente de espaço.
-2.  **`wizard_audit.sh` (v2.0)**: Extrai 100% das informações técnicas (Host + VMs) para arquivos de texto.
+1.  **`xen_backup.sh` (v13.0)**: Realiza backup seguro de VMs (`.xva`) para USB. Possui inteligência para lidar com storage cheio e correções automáticas.
+2.  **`xen_audit.sh` (v2.0)**: Extrai 100% das configurações técnicas (Rede, MACs, Hardware) para facilitar a recriação da VM.
+3.  **`xva_proxmox_import.sh` (v1.0)**: Automatiza a importação no Proxmox, convertendo discos e clonando as configurações de rede originais.
 
 ---
 
 ## 1. Wizard de Backup (`wizard_backup.sh`)
 
-Script automatizado para backup de VMs diretamente para HD Externo. Projetado para lidar com falhas de storage, interrupções (Ctrl+C) e tarefas travadas.
+Script de backup resiliente para XenServer. Projetado para ambientes críticos e storages com pouco espaço.
 
 ### Funcionalidades Principais
--   **Auto-Healing (Auto-Cura):** Detecta e remove resíduos de backups falhos (`BACKUP_TEMP_VM`) automaticamente ao iniciar.
--   **Safe Destroy:** Utiliza método seguro de limpeza que evita o aviso crítico de "Shared Disk", garantindo que o disco original nunca seja tocado.
--   **Modo Híbrido Inteligente (Smart Size Logic):**
-    -   **Cálculo Dinâmico:** O script calcula se há espaço suficiente para o snapshot baseado no tamanho da VM (Exige 25% do tamanho da VM livre no Storage).
-    -   **Previsão de Erro:** Se uma VM de 400GB tiver apenas 80GB livres no storage, o script marcará como `REQ. DESLIGAR` na listagem, evitando que você perca tempo tentando um snapshot que falhará.
-    -   **Fallback:** Se o espaço for insuficiente, ele oferece desligar a VM automaticamente.
+-   **Smart Size Logic:** Calcula dinamicamente se o storage tem espaço para um snapshot seguro (exige 25% do tamanho da VM livre). Se não tiver, sugere o modo *Shutdown* automaticamente.
+-   **Auto-Healing (Auto-Cura):** Detecta resíduos de falhas anteriores e limpa snapshots órfãos ao iniciar.
+-   **Safe Destroy:** Remove VMs temporárias sem gerar alertas de "Shared Disk", garantindo zero risco aos dados originais.
+-   **Anti-Freeze:** Detecta se a Toolstack (XAPI) travou e reinicia o serviço automaticamente.
+-   **Monitoramento em Tempo Real:** Exibe o progresso do tamanho do arquivo durante a exportação.
 
-### Como Usar
+### Como Usar (No XenServer)
 1.  Conecte o HD Externo.
 2.  Inicie uma sessão `screen` (recomendado):
     
     screen -S backup
 
-3.  Execute o script:
+3.  Execute:
     
     ./wizard_backup.sh
-
-4.  **Fluxo do Wizard:**
-    -   **Auto-Check:** Se houver lixo de execução anterior, ele pedirá para limpar.
-    -   **Montagem:** Selecione o disco. O script desmonta automaticamente se o disco estiver "busy".
-    -   **Seleção:** Uma tabela exibirá a saúde de cada VM.
-        -   *Status "REQ. DESLIGAR":* Significa que o storage está muito cheio para snapshot.
-    -   **Execução:** Acompanhe o progresso. Se um snapshot falhar, o script perguntará se você deseja tentar o método de desligamento.
 
 ---
 
 ## 2. Wizard de Auditoria (`wizard_audit.sh`)
 
-Script de documentação técnica profunda. Gera um "Raio-X" do servidor e das máquinas virtuais.
+Gera um "Raio-X" completo do ambiente XenServer. Essencial para garantir que a VM migrada terá as mesmas configurações.
 
 ### O que ele extrai?
-Cria uma pasta datada (ex: `AUDITORIA_2026-01-21`) contendo:
--   **Dados do Host Físico:** CPU, Versão, Patches instalados, Placas de Rede (PIFs).
--   **Dados das VMs:** Parâmetros de boot, BIOS strings, UUIDs.
--   **Discos e Rede:** Detalhes de VBDs (Discos virtuais) e VIFs (Interfaces virtuais, MACs).
+Cria arquivos de texto contendo:
+-   **Hardware:** Quantidade exata de vCPUs, RAM (em bytes) e ordem de boot.
+-   **Identidade de Rede:** Endereços MAC de todas as interfaces virtuais (VIFs) e suas respectivas VLANs/Networks.
+-   **Storage:** Mapeamento dos discos virtuais (VBDs).
 
-### Como Usar
-1.  Execute:
-    
+### Como Usar (No XenServer)
     ./wizard_audit.sh
 
-2.  Ao final, você pode escolher **manter o disco montado** para conferir os arquivos antes de remover.
+*Os arquivos serão salvos no HD Externo, na pasta `AUDITORIA_DATA`.*
 
 ---
 
-## Detalhes Técnicos
+## 3. Importador Proxmox (`xva_proxmox_import.sh`)
 
-### Estratégia de Backup (Hot vs Cold)
-O script decide dinamicamente a melhor estratégia:
+Script de automação para rodar no servidor de destino (**Proxmox**). Ele lê o backup `.xva` e os logs de auditoria para recriar a VM com fidelidade total.
 
-1.  **VMs Desligadas (Cold):** Usa `xe vm-export` direto. Seguro e não consome espaço extra no storage.
-2.  **VMs Ligadas (Hot - Snapshot):**
-    -   Cria Snapshot -> Clona para VM Temporária -> Exporta -> Destrói.
-    -   *Nota:* Requer espaço livre no Storage Repository (SR) igual ao tamanho das mudanças no disco.
-3.  **Fallback (Recuperação):** Se o Snapshot falhar (Erro `SR_BACKEND_FAILURE`), o script captura o erro e permite alternar para o modo Cold (Desligar/Ligar) na mesma hora.
+### Funcionalidades Exclusivas
+-   **Clonagem de Rede (Smart Network):** Lê os logs de auditoria para aplicar o **mesmo MAC Address** e a **mesma VLAN Tag** na nova VM. O roteador/switch nem perceberá a troca de hardware.
+-   **Conversão RAW:** Converte o arquivo XVA proprietário para `.raw` (bit-a-bit), garantindo máxima integridade e compatibilidade com ZFS/LVM-Thin.
+-   **Gestão de Dependências:** Instala e compila automaticamente a ferramenta `xva-img` se não estiver presente.
+-   **Logs Duplos:** Salva o relatório da importação tanto no Proxmox quanto no HD USB.
 
-### Correção de "Shared Disk Warning"
-Nas versões antigas, o comando `vm-uninstall` gerava alertas assustadores sobre discos compartilhados. A versão V11+ utiliza `xe vm-destroy` para remover apenas o registro da VM temporária e `xe snapshot-uninstall` para limpar os dados, eliminando qualquer risco aos discos originais.
+### Como Usar (No Proxmox)
+1.  Conecte o HD Externo (contendo os backups e a pasta de auditoria) no Proxmox.
+2.  Execute:
+    
+    ./xva_proxmox_import.sh
 
-### Logs e Auditoria
--   Todos os passos são registrados em log duplo (gravado no servidor em `/tmp` e no USB).
--   Se o script for interrompido (`Ctrl+C`), ele intercepta o sinal e tenta desmontar o disco com segurança.
+3.  **O Wizard irá:**
+    -   Montar o USB.
+    -   Listar os arquivos `.xva`.
+    -   Detectar automaticamente CPU, RAM e MACs originais.
+    -   Converter e importar o disco para o Storage local (ex: `local-zfs`).
 
 ---
 
-## Proteção e Agendamento
+## Detalhes Técnicos e Segurança
 
-### Proteção contra Quedas (Screen)
-Como backups podem demorar horas, sempre execute dentro do `screen`:
+### Estratégia de Backup (Híbrida)
+O script `wizard_backup.sh` decide a melhor rota:
+1.  **Hot Backup (Snapshot):** Se houver espaço (>25% do disco da VM), faz snapshot e exporta sem desligar.
+2.  **Cold Backup (Shutdown):** Se o storage estiver cheio, oferece desligar a VM temporariamente, exportar e religar. Isso contorna o erro `SR_BACKEND_FAILURE_44`.
 
-    yum install screen
-    screen -S backup_session
-    ./wizard_backup.sh
+### Estratégia de Importação
+Para garantir performance e não lotar o disco principal do Proxmox:
+-   O script permite escolher onde realizar a conversão temporária:
+    -   **[1] Local:** Mais rápido (SSD), mas exige espaço livre temporário igual ao tamanho da VM.
+    -   **[2] USB:** Mais lento, mas economiza espaço no servidor Proxmox.
 
--   **Sair e deixar rodando:** Pressione `Ctrl+A`, depois `D`.
--   **Voltar:** `screen -r backup_session`
+### Proteção contra Quedas
+Sempre execute processos longos dentro do `screen`.
+-   **Instalar:** `apt install screen` (Debian/Proxmox) ou `yum install screen` (CentOS/Xen).
+-   **Sair e manter rodando:** `Ctrl+A`, depois `D`.
+-   **Retomar:** `screen -r`.
 
-### Automação (Cron)
-Para agendar, crie uma cópia do script (`auto_backup.sh`), remova as perguntas interativas (`read -p`) e defina as variáveis no topo:
-
-    USB_DEVICE="/dev/sdb1"
-    SELECTION_UUIDS="uuid1 uuid2"
-    AUTO_UNMOUNT="S"
+### Logs
+Todos os scripts geram logs detalhados em `/tmp/` (ou `/var/log/`) e copiam uma versão final para a raiz do HD Externo para conferência posterior.

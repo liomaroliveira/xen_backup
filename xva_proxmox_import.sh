@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # MIGRATOR PRO: XENSERVER TO PROXMOX (IMPORT & CONVERT)
-# Versão: 1.0 (Network Clone & Auto-Dependency)
+# Versão: 1.1 (Fix xxhash dependency)
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -47,7 +47,8 @@ check_dependencies() {
         log "Ferramenta 'xva-img' não encontrada. Iniciando instalação automática..." "WARN"
         log "Atualizando repositórios e instalando compiladores (pode demorar)..."
         apt-get update -qq
-        apt-get install -y cmake g++ libssl-dev make git pv -qq
+        # CORREÇÃO V1.1: Adicionado libxxhash-dev
+        apt-get install -y cmake g++ libssl-dev make git pv libxxhash-dev -qq
         
         log "Baixando e compilando xva-img..."
         cd /tmp
@@ -62,7 +63,7 @@ check_dependencies() {
         if command -v xva-img &> /dev/null; then
             log "xva-img instalado com sucesso!" "SUCCESS"
         else
-            log "Falha ao instalar xva-img. Verifique sua internet." "ERROR"
+            log "Falha ao instalar xva-img. Verifique se o pacote libxxhash-dev foi instalado." "ERROR"
             exit 1
         fi
     else
@@ -350,7 +351,7 @@ run_import() {
 # --- EXECUÇÃO ---
 clear
 log "==============================================="
-log "   XEN TO PROXMOX - IMPORT WIZARD v1.0"
+log "   XEN TO PROXMOX - IMPORT WIZARD v1.1"
 log "==============================================="
 
 check_dependencies
