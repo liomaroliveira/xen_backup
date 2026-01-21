@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # MIGRATOR PRO: XENSERVER TO PROXMOX (IMPORT & CONVERT)
-# Versão: 1.3 (Local Source, Resource Check & Net Fix)
+# Versão: 1.4 (Bridge Menu & VLAN-Aware Auto-Fix)
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -48,7 +48,51 @@ check_dependencies() {
         chmod +x /usr/local/bin/xva-img
     fi
     if ! command -v pv &> /dev/null; then apt-get install -y pv -qq; fi
+    # Garante numfmt para calculos legiveis
+    if ! command -v numfmt &> /dev/null; then apt-get install -y coreutils -qq; fi
     log "Dependências OK." "SUCCESS"
+}
+
+# --- FUNÇÕES DE REDE (NOVO) ---
+
+configure_bridge_vlan() {
+    local bridge=$1
+    
+    # Verifica se já é VLAN Aware
+    if grep -q "iface $bridge" /etc/network/interfaces && grep -q "bridge-vlan-aware yes" /etc/network/interfaces; then
+        log "Bridge '$bridge' já está configurada como VLAN-Aware." "SUCCESS"
+        return 0
+    fi
+
+    log "AVISO: A bridge '$bridge' NÃO está configurada como 'bridge-vlan-aware yes'." "WARN"
+    log "Sem isso, as VLANs da VM podem não funcionar e gerar erro no boot."
+    echo ""
+    read -p "Deseja que eu ative o suporte a VLAN na bridge '$bridge' agora? (Isso recarregará a rede) [y/N]: " fix_vlan
+    
+    if [[ "$fix_vlan" =~ ^[yY]$ ]]; then
+        log "Aplicando correção na rede..."
+        
+        # 1. Backup
+        cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%s)
+        log "Backup da rede salvo em /etc/network/interfaces.bak.*"
+        
+        # 2. Inserir configuração (Usa sed para adicionar a linha na indentação correta)
+        # Procura a definição da interface e adiciona a linha logo abaixo
+        sed -i "/iface $bridge inet/a \\ \\ \\ \\ bridge-vlan-aware yes" /etc/network/interfaces
+        
+        # 3. Recarregar rede
+        log "Recarregando configurações de rede (ifreload -a)..."
+        ifreload -a
+        
+        if [ $? -eq 0 ]; then
+            log "Rede atualizada com sucesso! VLANs ativadas." "SUCCESS"
+        else
+            log "Falha ao recarregar a rede. Verifique '/etc/network/interfaces'." "ERROR"
+            # Restaura backup em caso de erro crítico? Opcional, aqui mantemos para análise.
+        fi
+    else
+        log "Mantendo configuração atual (Risco de erro 'status 6400')." "WARN"
+    fi
 }
 
 # --- FUNÇÕES DE FONTE ---
@@ -137,7 +181,6 @@ select_file() {
 }
 
 parse_audit_data() {
-    # Procura arquivos de auditoria no mesmo diretório base
     SEARCH_NAME=$(echo "$CLEAN_NAME" | tr '-' '_') 
     AUDIT_FILE=$(find "$MOUNT_POINT" -name "*${SEARCH_NAME}*_INFO.txt" | head -n 1)
     
@@ -175,23 +218,13 @@ parse_audit_data() {
 }
 
 validate_resources() {
-    log "Validando recursos do Host..."
-    
-    # 1. RAM Check
+    log "Validando recursos..."
     HOST_FREE_RAM=$(free -m | awk '/^Mem:/{print $7}')
     if [ "$SUGGEST_RAM" -gt "$HOST_FREE_RAM" ]; then
         log "ALERTA: Memória insuficiente! VM pede ${SUGGEST_RAM}MB, Host tem ${HOST_FREE_RAM}MB livres." "WARN"
-        read -p "Continuar mesmo assim? [y/N]: " force_ram
+        read -p "Continuar? [y/N]: " force_ram
         if [[ ! "$force_ram" =~ ^[yY]$ ]]; then exit 1; fi
     fi
-    
-    # 2. CPU Check
-    HOST_CORES=$(nproc)
-    if [ "$SUGGEST_CPU" -gt "$HOST_CORES" ]; then
-        log "ALERTA: VM pede ${SUGGEST_CPU} vCPUs, Host tem apenas ${HOST_CORES}." "WARN"
-    fi
-    
-    log "Recursos validados." "SUCCESS"
 }
 
 configure_vm() {
@@ -204,12 +237,12 @@ configure_vm() {
     
     read -p "Nome [$CLEAN_NAME]: " VMNAME
     VMNAME=${VMNAME:-$CLEAN_NAME}
-    VMNAME=$(echo "$VMNAME" | tr '_' '-') # Sanitize
+    VMNAME=$(echo "$VMNAME" | tr '_' '-')
     
     echo "Recursos: ${SUGGEST_CPU} vCPUs | ${SUGGEST_RAM} MB RAM"
     validate_resources
     
-    # --- MENU DE STORAGE MELHORADO ---
+    # --- MENU DE STORAGE (LEGÍVEL) ---
     echo ""
     log "Selecione o Storage de Destino:"
     mapfile -t STORAGES < <(pvesm status -enabled | awk 'NR>1 {print $1}')
@@ -218,9 +251,11 @@ configure_vm() {
 
     i=1
     for store in "${STORAGES[@]}"; do
-        # Converte bytes para legível
-        size_bytes=$(pvesm status -storage "$store" | awk 'NR==2 {print $6}')
-        size_human=$(numfmt --to=iec --suffix=B $size_bytes 2>/dev/null || echo "$size_bytes")
+        # Proxmox reporta em KB (units=1024), converte para legível (IEC)
+        size_kb=$(pvesm status -storage "$store" | awk 'NR==2 {print $6}')
+        # Se pvesm retornar bytes em algumas versoes, ajustamos. Padrao KB.
+        # numfmt --from-unit=1024 converte de KB para humano
+        size_human=$(numfmt --from-unit=1024 --to=iec $size_kb 2>/dev/null || echo "${size_kb}KB")
         type=$(pvesm status -storage "$store" | awk 'NR==2 {print $2}')
         echo "  [$i] $store (Tipo: $type | Livre: $size_human)"
         ((i++))
@@ -245,21 +280,36 @@ configure_vm() {
     fi
     mkdir -p "$WORK_DIR"
     
-    # --- MENU DE REDE (FIX BOOT ERROR) ---
+    # --- MENU DE REDE (NUMÉRICO + AUTO FIX) ---
     echo ""
-    log "Configuração de Rede (Bridges disponíveis):"
-    # Lista bridges reais do sistema
-    ip -br link show type bridge | awk '{print "  - " $1 " (" $2 ")"}'
+    log "Selecione a Bridge de Rede:"
+    mapfile -t BRIDGES < <(ip -br link show type bridge | awk '{print $1}')
     
-    read -p "Digite a Bridge a usar [vmbr0]: " SEL_BRIDGE
-    SEL_BRIDGE=${SEL_BRIDGE:-vmbr0}
+    if [ ${#BRIDGES[@]} -eq 0 ]; then
+        log "Nenhuma bridge encontrada! Criando VM sem rede." "WARN"
+        SEL_BRIDGE=""
+    else
+        i=1
+        for br in "${BRIDGES[@]}"; do
+            echo "  [$i] $br"
+            ((i++))
+        done
+        read -p "Opção de Bridge: " br_opt
+        SEL_BRIDGE="${BRIDGES[$((br_opt-1))]}"
+        [ -z "$SEL_BRIDGE" ] && SEL_BRIDGE="vmbr0"
+        log "Bridge Selecionada: $SEL_BRIDGE" "INFO"
+    fi
     
     USE_VLAN="n"
-    if [ ${#SUGGEST_VLANS[@]} -gt 0 ]; then
-        log "VLANs detectadas no backup: ${SUGGEST_VLANS[*]}"
-        log "AVISO: Se a bridge '$SEL_BRIDGE' não for VLAN-Aware, o boot pode falhar."
+    if [ ${#SUGGEST_VLANS[@]} -gt 0 ] && [ -n "$SEL_BRIDGE" ]; then
+        log "VLANs detectadas: ${SUGGEST_VLANS[*]}"
         read -p "Deseja aplicar as Tags de VLAN na VM? [y/N]: " vlan_opt
         USE_VLAN=${vlan_opt:-n}
+        
+        # AUTO-FIX VLAN AWARE
+        if [[ "$USE_VLAN" =~ ^[yY]$ ]]; then
+            configure_bridge_vlan "$SEL_BRIDGE"
+        fi
     fi
 }
 
@@ -272,16 +322,15 @@ run_import() {
         exit 1
     fi
     
-    # 2. Configurar Rede com Segurança
+    # 2. Configurar Rede
     log "Configurando Rede..."
-    if [ ${#SUGGEST_MACS[@]} -eq 0 ]; then
-        qm set $VMID --net0 virtio,bridge=$SEL_BRIDGE
+    if [ ${#SUGGEST_MACS[@]} -eq 0 ] || [ -z "$SEL_BRIDGE" ]; then
+        [ -n "$SEL_BRIDGE" ] && qm set $VMID --net0 virtio,bridge=$SEL_BRIDGE
     else
         idx=0
         for mac in "${SUGGEST_MACS[@]}"; do
             vlan="${SUGGEST_VLANS[$idx]}"
             tag_cmd=""
-            # Só aplica VLAN se usuário confirmou
             if [[ "$USE_VLAN" =~ ^[yY]$ ]] && [ -n "$vlan" ] && [ "$vlan" != "1" ]; then
                 tag_cmd=",tag=$vlan"
             fi
@@ -320,20 +369,19 @@ run_import() {
         qm set $VMID --boot c --bootdisk scsi0
         qm set $VMID --agent 1
     else
-        log "AVISO: Disco importado, mas não anexado automaticamente. Verifique no Hardware da VM." "WARN"
+        log "AVISO: Disco importado, mas não anexado. Verifique Hardware." "WARN"
     fi
     
     # Limpeza
     rm -rf "$WORK_DIR/Ref"* "$WORK_DIR/disk.raw" "$WORK_DIR/ova.xml"
     
     log "SUCESSO! VM $VMID criada." "SUCCESS"
-    log "DICA: Se a VM não ligar por erro de rede, edite a placa de rede no Hardware e remova a VLAN Tag."
 }
 
 # --- EXECUÇÃO ---
 clear
 log "==============================================="
-log "   XEN TO PROXMOX - IMPORT WIZARD v1.3"
+log "   XEN TO PROXMOX - IMPORT WIZARD v1.4"
 log "==============================================="
 
 check_dependencies
