@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# WIZARD DE BACKUP XENSERVER - V12.0 (ANTI-FREEZE)
+# WIZARD DE BACKUP XENSERVER - V13.0 (SMART SIZE)
 # ==========================================
 
 # Configurações Iniciais
@@ -9,7 +9,6 @@ DATE_NOW=$(date +%Y-%m-%d_%H-%M)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILENAME="backup_log_${DATE_NOW}.txt"
 TEMP_LOG="/tmp/${LOG_FILENAME}"
-SNAPSHOT_SAFE_MARGIN=5
 
 # Trap para Ctrl+C
 trap ctrl_c INT
@@ -63,36 +62,28 @@ monitor_export() {
 
 clear
 log_msg "=========================================="
-log_msg "   WIZARD DE BACKUP XENSERVER - V12.0     "
+log_msg "   WIZARD DE BACKUP XENSERVER - V13.0     "
 log_msg "=========================================="
 log_msg "Data: $DATE_NOW"
 
 # ----------------------------------------
-# 0. AUTO-DIAGNÓSTICO E LIMPEZA
+# 0. AUTO-DIAGNÓSTICO
 # ----------------------------------------
 log_msg "[0/4] Verificando saúde do XenServer..."
 
-# 1. Checagem de Tarefas Travadas (IMPLEMENTAÇÃO SOLICITADA)
 PENDING_TASKS=$(xe task-list status=pending params=uuid --minimal)
-
 if [ -n "$PENDING_TASKS" ]; then
-    log_msg "[ALERTA] Detectadas tarefas travadas/pendentes na Toolstack."
-    log_msg "Isso pode impedir a limpeza de VMs antigas."
+    log_msg "[ALERTA] Detectadas tarefas travadas/pendentes."
     read -p "Deseja reiniciar a Toolstack (XAPI) para destravar? [S/n]: " toolstack_opt
     toolstack_opt=${toolstack_opt:-S}
-    
     if [[ "$toolstack_opt" =~ ^[sS]$ ]]; then
-        log_msg "Reiniciando Toolstack (Isso não desliga as VMs)..."
+        log_msg "Reiniciando Toolstack..."
         xe-toolstack-restart
-        log_msg "Aguardando 10 segundos para estabilização..."
         sleep 10
         log_msg "Toolstack reiniciada."
-    else
-        log_msg "Pulando reinício da Toolstack (Risco de travamento mantido)."
     fi
 fi
 
-# 2. Limpeza de Órfãos
 ORPHAN_VMS=$(xe vm-list name-label="BACKUP_TEMP_VM" params=uuid --minimal)
 ORPHAN_SNAPS=$(xe snapshot-list name-label="BACKUP_TEMP_SNAP" params=uuid --minimal)
 
@@ -149,7 +140,6 @@ echo ""
 # ----------------------------------------
 log_msg "[2/4] Configuração de Montagem"
 
-# Desmonta se já estiver montado em outro lugar
 CURRENT_MOUNT=$(lsblk -n -o MOUNTPOINT $USB_DEVICE | head -n 1)
 if [ -n "$CURRENT_MOUNT" ]; then
     log_msg "AVISO: Dispositivo já montado em: $CURRENT_MOUNT"
@@ -198,10 +188,12 @@ read -p "Deseja DESMONTAR automaticamente ao final? [S/n]: " auto_unmount_opt
 AUTO_UNMOUNT=${auto_unmount_opt:-S}
 
 # ----------------------------------------
-# 3. ANÁLISE DE VMS
+# 3. ANÁLISE DE VMS (SMART SIZE CHECK)
 # ----------------------------------------
 echo ""
 log_msg "[3/4] Analisando VMs..."
+log_msg "Critério de Viabilidade: 25% do tamanho da VM livre no Storage."
+
 echo "--------------------------------------------------------------------------------------------------------------------"
 printf "%-3s | %-18s | %-8s | %-12s | %-25s | %-15s\n" "ID" "NOME" "STATUS" "TAM. VM" "STORAGE (LIVRE)" "VIABILIDADE"
 echo "--------------------------------------------------------------------------------------------------------------------"
@@ -248,13 +240,18 @@ for uuid in $VM_UUID_LIST; do
     done
     DISK_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
 
+    # CÁLCULO DINÂMICO DE SEGURANÇA
+    # Exige 25% do tamanho da VM livre no Storage, ou mínimo de 10GB
+    REQUIRED_SPACE=$((DISK_GB / 4))
+    if [ "$REQUIRED_SPACE" -lt 10 ]; then REQUIRED_SPACE=10; fi
+
     MSG_VIAVEL="ERRO"
     IS_VIABLE=true
     
     if [ "$STATE" == "halted" ]; then
         MSG_VIAVEL="OK (DIRETO)"
     else
-        if [ "$SR_FREE_GB" -lt "$SNAPSHOT_SAFE_MARGIN" ]; then
+        if [ "$SR_FREE_GB" -lt "$REQUIRED_SPACE" ]; then
             MSG_VIAVEL="REQ. DESLIGAR"
             IS_VIABLE=false
         else
@@ -299,13 +296,15 @@ for vm_id in $selection; do
     log_msg "------------------------------------------------"
     log_msg ">>> Processando: $VM_NAME ($STATE)"
     
+    # Validação Inteligente (Smart Size)
     if [ "$STATE" == "running" ] && [ "$IS_VIABLE" = false ]; then
-        log_msg "    [ALERTA] Storage cheio."
-        read -p "    Deseja DESLIGAR a VM para backup seguro? [y/N]: " shut_opt
+        log_msg "    [ALERTA PREVENTIVO] Espaço insuficiente para Snapshot seguro."
+        log_msg "    A VM tem ${DISK_GB}GB, mas o Storage só tem ${SR_FREE_GB}GB livres."
+        read -p "    Deseja DESLIGAR a VM automaticamente para backup seguro? [y/N]: " shut_opt
         if [[ "$shut_opt" =~ ^[yY]$ ]]; then
             FORCE_SHUTDOWN=true
         else
-            log_msg "    Pulando VM."
+            log_msg "    Pulando VM por risco de travamento de storage."
             ((FAIL_COUNT++))
             continue
         fi

@@ -16,11 +16,10 @@ Script automatizado para backup de VMs diretamente para HD Externo. Projetado pa
 ### Funcionalidades Principais
 -   **Auto-Healing (Auto-Cura):** Detecta e remove resíduos de backups falhos (`BACKUP_TEMP_VM`) automaticamente ao iniciar.
 -   **Safe Destroy:** Utiliza método seguro de limpeza que evita o aviso crítico de "Shared Disk", garantindo que o disco original nunca seja tocado.
--   **Modo Híbrido Inteligente:**
-    -   Se o Storage tiver espaço: Faz backup a quente (Snapshot).
-    -   Se o Storage estiver cheio: Detecta o erro e oferece desligar a VM temporariamente para fazer o backup a frio (Shutdown -> Export -> Start).
--   **Destravamento de Toolstack:** Detecta se o XenServer está travado com tarefas pendentes (zumbis) e oferece reiniciar a Toolstack (`xe-toolstack-restart`) automaticamente.
--   **Monitoramento em Tempo Real:** Exibe o crescimento do arquivo de backup durante a exportação.
+-   **Modo Híbrido Inteligente (Smart Size Logic):**
+    -   **Cálculo Dinâmico:** O script calcula se há espaço suficiente para o snapshot baseado no tamanho da VM (Exige 25% do tamanho da VM livre no Storage).
+    -   **Previsão de Erro:** Se uma VM de 400GB tiver apenas 80GB livres no storage, o script marcará como `REQ. DESLIGAR` na listagem, evitando que você perca tempo tentando um snapshot que falhará.
+    -   **Fallback:** Se o espaço for insuficiente, ele oferece desligar a VM automaticamente.
 
 ### Como Usar
 1.  Conecte o HD Externo.
