@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 # MIGRATOR PRO: XENSERVER TO PROXMOX (IMPORT & CONVERT)
-# Versão: 1.4 (Bridge Menu & VLAN-Aware Auto-Fix)
+# Versão: 1.6 (Smart Temp Storage Selection)
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
 LOG_FILE="/var/log/xva_import_$(date +%Y%m%d_%H%M).log"
-TEMP_DIR_LOCAL="/var/tmp/xva_conversion"
+TEMP_DIR_ROOT="/var/tmp/xva_conversion"
 
 # --- CORES ---
 RED='\033[0;31m'
@@ -36,7 +36,7 @@ check_dependencies() {
     if ! command -v xva-img &> /dev/null; then
         log "Instalando xva-img e dependências..." "WARN"
         apt-get update -qq
-        apt-get install -y cmake g++ libssl-dev make git pv libxxhash-dev -qq
+        apt-get install -y cmake g++ libssl-dev make git pv libxxhash-dev coreutils -qq
         
         cd /tmp
         rm -rf xva-img
@@ -48,50 +48,22 @@ check_dependencies() {
         chmod +x /usr/local/bin/xva-img
     fi
     if ! command -v pv &> /dev/null; then apt-get install -y pv -qq; fi
-    # Garante numfmt para calculos legiveis
     if ! command -v numfmt &> /dev/null; then apt-get install -y coreutils -qq; fi
     log "Dependências OK." "SUCCESS"
 }
 
-# --- FUNÇÕES DE REDE (NOVO) ---
-
 configure_bridge_vlan() {
     local bridge=$1
-    
-    # Verifica se já é VLAN Aware
     if grep -q "iface $bridge" /etc/network/interfaces && grep -q "bridge-vlan-aware yes" /etc/network/interfaces; then
-        log "Bridge '$bridge' já está configurada como VLAN-Aware." "SUCCESS"
         return 0
     fi
-
-    log "AVISO: A bridge '$bridge' NÃO está configurada como 'bridge-vlan-aware yes'." "WARN"
-    log "Sem isso, as VLANs da VM podem não funcionar e gerar erro no boot."
-    echo ""
-    read -p "Deseja que eu ative o suporte a VLAN na bridge '$bridge' agora? (Isso recarregará a rede) [y/N]: " fix_vlan
-    
+    log "AVISO: Bridge '$bridge' não é VLAN-Aware." "WARN"
+    read -p "Deseja ativar VLAN-Aware em '$bridge'? (Recarrega rede) [y/N]: " fix_vlan
     if [[ "$fix_vlan" =~ ^[yY]$ ]]; then
-        log "Aplicando correção na rede..."
-        
-        # 1. Backup
         cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%s)
-        log "Backup da rede salvo em /etc/network/interfaces.bak.*"
-        
-        # 2. Inserir configuração (Usa sed para adicionar a linha na indentação correta)
-        # Procura a definição da interface e adiciona a linha logo abaixo
         sed -i "/iface $bridge inet/a \\ \\ \\ \\ bridge-vlan-aware yes" /etc/network/interfaces
-        
-        # 3. Recarregar rede
-        log "Recarregando configurações de rede (ifreload -a)..."
         ifreload -a
-        
-        if [ $? -eq 0 ]; then
-            log "Rede atualizada com sucesso! VLANs ativadas." "SUCCESS"
-        else
-            log "Falha ao recarregar a rede. Verifique '/etc/network/interfaces'." "ERROR"
-            # Restaura backup em caso de erro crítico? Opcional, aqui mantemos para análise.
-        fi
-    else
-        log "Mantendo configuração atual (Risco de erro 'status 6400')." "WARN"
+        log "Rede atualizada." "SUCCESS"
     fi
 }
 
@@ -107,7 +79,7 @@ select_source() {
     if [ "$src_opt" == "1" ]; then
         detect_usb
     else
-        read -p "Digite o caminho completo (ex: /mnt/pve/backups): " custom_path
+        read -p "Digite o caminho completo: " custom_path
         if [ -d "$custom_path" ]; then
             MOUNT_POINT="$custom_path"
             log "Origem definida: $MOUNT_POINT" "INFO"
@@ -121,9 +93,7 @@ select_source() {
 detect_usb() {
     log "Detectando USBs..."
     mapfile -t DISKS < <(lsblk -rn -o NAME,SIZE,TRAN,MOUNTPOINT | grep "usb" | grep -v "sda")
-    if [ ${#DISKS[@]} -eq 0 ]; then
-        mapfile -t DISKS < <(lsblk -rn -o NAME,SIZE,TRAN,MOUNTPOINT | grep "sd" | grep -v "sda")
-    fi
+    [ ${#DISKS[@]} -eq 0 ] && mapfile -t DISKS < <(lsblk -rn -o NAME,SIZE,TRAN,MOUNTPOINT | grep "sd" | grep -v "sda")
 
     if [ ${#DISKS[@]} -eq 0 ]; then
         log "Nenhum disco USB encontrado." "ERROR"
@@ -132,47 +102,33 @@ detect_usb() {
 
     echo "------------------------------------------------"
     i=1
-    for disk in "${DISKS[@]}"; do
-        echo "[$i] /dev/$disk"
-        ((i++))
-    done
+    for disk in "${DISKS[@]}"; do echo "[$i] /dev/$disk"; ((i++)); done
     echo "------------------------------------------------"
     read -p "Número do HD: " disk_opt
     
     SELECTED_DISK_LINE="${DISKS[$((disk_opt-1))]}"
     SELECTED_DEV="/dev/$(echo $SELECTED_DISK_LINE | awk '{print $1}')"
-    
     MOUNT_POINT="/mnt/xva_import_usb"
     mkdir -p $MOUNT_POINT
     
     CURRENT_MOUNT=$(echo $SELECTED_DISK_LINE | awk '{print $4}')
-    if [ -n "$CURRENT_MOUNT" ]; then
-        MOUNT_POINT="$CURRENT_MOUNT"
-    else
-        mount $SELECTED_DEV $MOUNT_POINT
-    fi
+    if [ -n "$CURRENT_MOUNT" ]; then MOUNT_POINT="$CURRENT_MOUNT"; else mount $SELECTED_DEV $MOUNT_POINT; fi
 }
 
 select_file() {
-    log "Buscando arquivos .xva em $MOUNT_POINT..."
+    log "Buscando arquivos .xva..."
     mapfile -t FILES < <(find "$MOUNT_POINT" -maxdepth 3 -name "*.xva" | sort)
-
-    if [ ${#FILES[@]} -eq 0 ]; then
-        log "Nenhum arquivo .xva encontrado neste local." "ERROR"
-        exit 1
-    fi
+    [ ${#FILES[@]} -eq 0 ] && { log "Nenhum arquivo .xva encontrado." "ERROR"; exit 1; }
 
     echo "----------------------------------------------------------------"
     printf "%-3s | %-50s | %-10s\n" "ID" "ARQUIVO" "TAMANHO"
     echo "----------------------------------------------------------------"
     i=1
     for f in "${FILES[@]}"; do
-        fname=$(basename "$f")
         fsize=$(ls -lh "$f" | awk '{print $5}')
-        printf "%-3s | %-50s | %-10s\n" "$i" "${fname:0:50}" "$fsize"
+        printf "%-3s | %-50s | %-10s\n" "$i" "${f##*/}" "$fsize"
         ((i++))
     done
-    echo "----------------------------------------------------------------"
     
     read -p "Arquivo ID: " file_opt
     XVA_FILE="${FILES[$((file_opt-1))]}"
@@ -184,13 +140,10 @@ parse_audit_data() {
     SEARCH_NAME=$(echo "$CLEAN_NAME" | tr '-' '_') 
     AUDIT_FILE=$(find "$MOUNT_POINT" -name "*${SEARCH_NAME}*_INFO.txt" | head -n 1)
     
-    SUGGEST_CPU=2
-    SUGGEST_RAM=2048
-    SUGGEST_MACS=()
-    SUGGEST_VLANS=()
+    SUGGEST_CPU=2; SUGGEST_RAM=2048; SUGGEST_MACS=(); SUGGEST_VLANS=()
     
     if [ -f "$AUDIT_FILE" ]; then
-        log "Auditoria encontrada: $(basename "$AUDIT_FILE")" "SUCCESS"
+        log "Auditoria encontrada." "SUCCESS"
         CPU_READ=$(grep "VCPUs-max" "$AUDIT_FILE" | head -1 | awk '{print $NF}')
         [ -n "$CPU_READ" ] && SUGGEST_CPU=$CPU_READ
         RAM_BYTES=$(grep "memory-static-max" "$AUDIT_FILE" | head -1 | awk '{print $NF}')
@@ -201,29 +154,51 @@ parse_audit_data() {
             if [[ $line == *"MAC ( RO):"* ]] && [ "$vif_active" == "true" ]; then mac=$(echo $line | awk '{print $4}'); fi
             if [[ $line == *"network-name-label"* ]] && [ "$vif_active" == "true" ]; then
                 net=$(echo $line | awk '{print $4}')
-                vlan=""
-                if [[ $net =~ VLAN([0-9]+) ]]; then vlan="${BASH_REMATCH[1]}"
-                elif [[ $net =~ vlan([0-9]+) ]]; then vlan="${BASH_REMATCH[1]}"; fi
-                
-                if [ -n "$mac" ]; then
-                    SUGGEST_MACS+=("$mac")
-                    SUGGEST_VLANS+=("${vlan:-1}")
-                    vif_active="false"
-                fi
+                if [[ $net =~ VLAN([0-9]+) ]]; then vlan="${BASH_REMATCH[1]}"; elif [[ $net =~ vlan([0-9]+) ]]; then vlan="${BASH_REMATCH[1]}"; else vlan=""; fi
+                if [ -n "$mac" ]; then SUGGEST_MACS+=("$mac"); SUGGEST_VLANS+=("${vlan:-1}"); vif_active="false"; fi
             fi
         done < "$AUDIT_FILE"
-    else
-        log "Auditoria não encontrada. Usando valores padrão." "WARN"
     fi
 }
 
-validate_resources() {
-    log "Validando recursos..."
+validate_host_resources() {
     HOST_FREE_RAM=$(free -m | awk '/^Mem:/{print $7}')
     if [ "$SUGGEST_RAM" -gt "$HOST_FREE_RAM" ]; then
-        log "ALERTA: Memória insuficiente! VM pede ${SUGGEST_RAM}MB, Host tem ${HOST_FREE_RAM}MB livres." "WARN"
-        read -p "Continuar? [y/N]: " force_ram
-        if [[ ! "$force_ram" =~ ^[yY]$ ]]; then exit 1; fi
+        log "ALERTA: Host tem pouca RAM (${HOST_FREE_RAM}MB) para esta VM (${SUGGEST_RAM}MB)." "WARN"
+        read -p "Continuar? [y/N]: " force_ram; [[ ! "$force_ram" =~ ^[yY]$ ]] && exit 1
+    fi
+}
+
+check_disk_space() {
+    local target_dir=$1
+    log "Calculando tamanho REAL do disco (extraindo metadados)..."
+    
+    mkdir -p "$target_dir"
+    tar -xf "$XVA_FILE" -C "$target_dir" ova.xml 2>/dev/null
+    
+    if [ ! -f "$target_dir/ova.xml" ]; then
+        log "AVISO: Não foi possível ler metadados. Estimando x2..." "WARN"
+        TOTAL_REQ_BYTES=$(($(stat -c%s "$XVA_FILE") * 2))
+    else
+        TOTAL_REQ_BYTES=$(grep "virtual_size" "$target_dir/ova.xml" | awk -F'"' '{s+=$2} END {print s}')
+        rm -f "$target_dir/ova.xml"
+    fi
+    
+    # Verifica espaço no caminho escolhido
+    AVAIL_BYTES=$(df --output=avail -B1 "$target_dir" | tail -1)
+    
+    REQ_GB=$((TOTAL_REQ_BYTES / 1024 / 1024 / 1024))
+    AVAIL_GB=$((AVAIL_BYTES / 1024 / 1024 / 1024))
+    
+    log "Espaço Necessário (Expandido): ~${REQ_GB} GB"
+    log "Espaço Disponível em $target_dir: ${AVAIL_GB} GB"
+    
+    if [ "$TOTAL_REQ_BYTES" -gt "$AVAIL_BYTES" ]; then
+        log "CRITICAL: Espaço insuficiente em $target_dir!" "ERROR"
+        log "A conversão falhará. Escolha um storage maior (ex: os 4TB) ou o USB."
+        exit 1
+    else
+        log "Espaço OK. Prosseguindo." "SUCCESS"
     fi
 }
 
@@ -232,97 +207,93 @@ configure_vm() {
     log "--- CONFIGURAÇÃO ---"
     
     NEXT_ID=$(pvesh get /cluster/nextid)
-    read -p "ID VM [$NEXT_ID]: " VMID
-    VMID=${VMID:-$NEXT_ID}
+    read -p "ID VM [$NEXT_ID]: " VMID; VMID=${VMID:-$NEXT_ID}
+    read -p "Nome [$CLEAN_NAME]: " VMNAME; VMNAME=${VMNAME:-$CLEAN_NAME}; VMNAME=$(echo "$VMNAME" | tr '_' '-')
     
-    read -p "Nome [$CLEAN_NAME]: " VMNAME
-    VMNAME=${VMNAME:-$CLEAN_NAME}
-    VMNAME=$(echo "$VMNAME" | tr '_' '-')
+    validate_host_resources
     
-    echo "Recursos: ${SUGGEST_CPU} vCPUs | ${SUGGEST_RAM} MB RAM"
-    validate_resources
-    
-    # --- MENU DE STORAGE (LEGÍVEL) ---
-    echo ""
-    log "Selecione o Storage de Destino:"
+    # --- STORAGE DE DESTINO (ONDE A VM VAI MORAR) ---
+    echo ""; log "Selecione o Storage de Destino (Onde a VM vai ficar):"
     mapfile -t STORAGES < <(pvesm status -enabled | awk 'NR>1 {print $1}')
-    
-    if [ ${#STORAGES[@]} -eq 0 ]; then log "Sem storage!" "ERROR"; exit 1; fi
+    [ ${#STORAGES[@]} -eq 0 ] && { log "Sem storage!" "ERROR"; exit 1; }
 
     i=1
     for store in "${STORAGES[@]}"; do
-        # Proxmox reporta em KB (units=1024), converte para legível (IEC)
         size_kb=$(pvesm status -storage "$store" | awk 'NR==2 {print $6}')
-        # Se pvesm retornar bytes em algumas versoes, ajustamos. Padrao KB.
-        # numfmt --from-unit=1024 converte de KB para humano
         size_human=$(numfmt --from-unit=1024 --to=iec $size_kb 2>/dev/null || echo "${size_kb}KB")
         type=$(pvesm status -storage "$store" | awk 'NR==2 {print $2}')
         echo "  [$i] $store (Tipo: $type | Livre: $size_human)"
         ((i++))
     done
-    
-    read -p "Opção: " store_opt
-    TARGET_STORAGE="${STORAGES[$((store_opt-1))]}"
+    read -p "Opção: " store_opt; TARGET_STORAGE="${STORAGES[$((store_opt-1))]}"
     [ -z "$TARGET_STORAGE" ] && TARGET_STORAGE="local-lvm"
-    log "Storage: $TARGET_STORAGE" "INFO"
 
-    # Conversão
-    echo ""
-    log "Local Temporário de Conversão:"
-    log "  [1] Local ($TEMP_DIR_LOCAL) - Rápido"
-    log "  [2] Na Origem ($MOUNT_POINT) - Economiza espaço local"
-    read -p "Opção [1]: " temp_opt
+    # --- NOVO MENU: STORAGE TEMPORÁRIO (ONDE VAMOS TRABALHAR) ---
+    echo ""; log "Selecione o Local Temporário para Conversão (.raw):"
+    echo "  [1] Usar o HD Externo (Seguro - Espaço do USB)"
+    echo "  [2] Partição do Sistema (Rápido - Cuidado! Apenas 100GB)"
     
-    if [ "$temp_opt" == "2" ]; then
+    # Busca Storages que suportam arquivos (Directory/ZFS) para usar o espaço deles
+    mapfile -t FILE_STORAGES < <(pvesm status -content images -enabled | awk 'NR>1 {print $1}')
+    idx=3
+    declare -a STORAGE_PATHS
+    
+    for fs_store in "${FILE_STORAGES[@]}"; do
+        path=$(pvesm path "$fs_store" "$VMID" 2>/dev/null | xargs dirname 2>/dev/null)
+        # Se pvesm path falhar, tenta pegar config dir
+        if [ -z "$path" ]; then
+             path=$(grep -A5 "^dir: $fs_store" /etc/pve/storage.cfg | grep "path" | awk '{print $2}')
+        fi
+        
+        # Só mostra se achou um caminho válido e gravável
+        if [ -n "$path" ] && [ -d "$path" ]; then
+            avail=$(df -h "$path" | awk 'NR==2 {print $4}')
+            echo "  [$idx] Storage Proxmox: $fs_store (Livre: $avail)"
+            STORAGE_PATHS[$idx]="$path/temp_xva"
+            ((idx++))
+        fi
+    done
+    
+    read -p "Opção [1]: " temp_opt
+    temp_opt=${temp_opt:-1}
+    
+    if [ "$temp_opt" == "1" ]; then
         WORK_DIR="$MOUNT_POINT/temp_conversion"
+    elif [ "$temp_opt" == "2" ]; then
+        WORK_DIR="$TEMP_DIR_ROOT"
+    elif [ -n "${STORAGE_PATHS[$temp_opt]}" ]; then
+        WORK_DIR="${STORAGE_PATHS[$temp_opt]}"
+        log "Usando storage do Proxmox: $WORK_DIR" "INFO"
     else
-        WORK_DIR="$TEMP_DIR_LOCAL"
+        log "Opção inválida. Usando USB." "WARN"
+        WORK_DIR="$MOUNT_POINT/temp_conversion"
     fi
     mkdir -p "$WORK_DIR"
     
-    # --- MENU DE REDE (NUMÉRICO + AUTO FIX) ---
-    echo ""
-    log "Selecione a Bridge de Rede:"
-    mapfile -t BRIDGES < <(ip -br link show type bridge | awk '{print $1}')
+    # Valida espaço no local escolhido
+    check_disk_space "$WORK_DIR"
     
-    if [ ${#BRIDGES[@]} -eq 0 ]; then
-        log "Nenhuma bridge encontrada! Criando VM sem rede." "WARN"
-        SEL_BRIDGE=""
-    else
-        i=1
-        for br in "${BRIDGES[@]}"; do
-            echo "  [$i] $br"
-            ((i++))
-        done
-        read -p "Opção de Bridge: " br_opt
-        SEL_BRIDGE="${BRIDGES[$((br_opt-1))]}"
-        [ -z "$SEL_BRIDGE" ] && SEL_BRIDGE="vmbr0"
-        log "Bridge Selecionada: $SEL_BRIDGE" "INFO"
-    fi
+    # --- REDE ---
+    echo ""; log "Selecione a Bridge de Rede:"
+    mapfile -t BRIDGES < <(ip -br link show type bridge | awk '{print $1}')
+    i=1; for br in "${BRIDGES[@]}"; do echo "  [$i] $br"; ((i++)); done
+    read -p "Opção: " br_opt; SEL_BRIDGE="${BRIDGES[$((br_opt-1))]}"
+    [ -z "$SEL_BRIDGE" ] && SEL_BRIDGE="vmbr0"
     
     USE_VLAN="n"
     if [ ${#SUGGEST_VLANS[@]} -gt 0 ] && [ -n "$SEL_BRIDGE" ]; then
         log "VLANs detectadas: ${SUGGEST_VLANS[*]}"
-        read -p "Deseja aplicar as Tags de VLAN na VM? [y/N]: " vlan_opt
-        USE_VLAN=${vlan_opt:-n}
-        
-        # AUTO-FIX VLAN AWARE
-        if [[ "$USE_VLAN" =~ ^[yY]$ ]]; then
-            configure_bridge_vlan "$SEL_BRIDGE"
-        fi
+        read -p "Deseja aplicar as Tags de VLAN? [y/N]: " vlan_opt; USE_VLAN=${vlan_opt:-n}
+        [[ "$USE_VLAN" =~ ^[yY]$ ]] && configure_bridge_vlan "$SEL_BRIDGE"
     fi
 }
 
 run_import() {
-    log "Iniciando criação..."
-    
-    # 1. Criar VM
+    log "Criando VM $VMID..."
     if ! qm create $VMID --name "$VMNAME" --memory $SUGGEST_RAM --cores $SUGGEST_CPU --ostype l26 --scsihw virtio-scsi-pci; then
-        log "Falha ao criar VM. Verifique ID/Nome." "ERROR"
-        exit 1
+        log "Falha ao criar VM." "ERROR"; exit 1
     fi
     
-    # 2. Configurar Rede
     log "Configurando Rede..."
     if [ ${#SUGGEST_MACS[@]} -eq 0 ] || [ -z "$SEL_BRIDGE" ]; then
         [ -n "$SEL_BRIDGE" ] && qm set $VMID --net0 virtio,bridge=$SEL_BRIDGE
@@ -330,58 +301,41 @@ run_import() {
         idx=0
         for mac in "${SUGGEST_MACS[@]}"; do
             vlan="${SUGGEST_VLANS[$idx]}"
-            tag_cmd=""
-            if [[ "$USE_VLAN" =~ ^[yY]$ ]] && [ -n "$vlan" ] && [ "$vlan" != "1" ]; then
-                tag_cmd=",tag=$vlan"
-            fi
-            
-            log "  -> net$idx: MAC=$mac Bridge=$SEL_BRIDGE $tag_cmd"
+            tag_cmd=""; [[ "$USE_VLAN" =~ ^[yY]$ ]] && [ -n "$vlan" ] && [ "$vlan" != "1" ] && tag_cmd=",tag=$vlan"
             qm set $VMID --net$idx virtio,bridge=$SEL_BRIDGE,macaddr=$mac$tag_cmd
             ((idx++))
         done
     fi
     
-    # 3. Conversão e Importação
-    log "Extraindo XVA..."
-    rm -rf "$WORK_DIR/Ref"* 2>/dev/null
-    rm -f "$WORK_DIR/disk.raw" 2>/dev/null
-    
+    log "Convertendo disco (pode demorar)..."
+    rm -rf "$WORK_DIR/Ref"* "$WORK_DIR/disk.raw" 2>/dev/null
     tar -xf "$XVA_FILE" -C "$WORK_DIR"
+    
     DISK_REF_DIR=$(du -s "$WORK_DIR"/Ref* | sort -nr | head -n 1 | awk '{print $2}')
-    
-    if [ -z "$DISK_REF_DIR" ]; then log "Disco não encontrado no XVA." "ERROR"; exit 1; fi
-    
-    log "Convertendo para RAW..."
     /usr/local/bin/xva-img -p disk-export "$DISK_REF_DIR/" "$WORK_DIR/disk.raw"
     
-    if [ ! -f "$WORK_DIR/disk.raw" ]; then log "Erro na conversão." "ERROR"; exit 1; fi
+    if [ ! -f "$WORK_DIR/disk.raw" ]; then log "Erro crítico na conversão." "ERROR"; exit 1; fi
     
     log "Importando para $TARGET_STORAGE..."
     if ! qm importdisk $VMID "$WORK_DIR/disk.raw" $TARGET_STORAGE --format raw; then
-        log "Erro na importação. Verifique espaço no storage." "ERROR"
-        exit 1
+        log "Erro na importação." "ERROR"; exit 1
     fi
     
-    # 4. Finalização
     IMPORTED_DISK=$(qm config $VMID | grep unused | head -n 1 | awk '{print $2}')
     if [ -n "$IMPORTED_DISK" ]; then
         qm set $VMID --scsi0 $IMPORTED_DISK,ssd=1
         qm set $VMID --boot c --bootdisk scsi0
         qm set $VMID --agent 1
-    else
-        log "AVISO: Disco importado, mas não anexado. Verifique Hardware." "WARN"
     fi
     
-    # Limpeza
     rm -rf "$WORK_DIR/Ref"* "$WORK_DIR/disk.raw" "$WORK_DIR/ova.xml"
-    
-    log "SUCESSO! VM $VMID criada." "SUCCESS"
+    log "SUCESSO! VM $VMID Importada." "SUCCESS"
 }
 
 # --- EXECUÇÃO ---
 clear
 log "==============================================="
-log "   XEN TO PROXMOX - IMPORT WIZARD v1.4"
+log "   XEN TO PROXMOX - IMPORT WIZARD v1.6"
 log "==============================================="
 
 check_dependencies
