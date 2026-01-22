@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # MIGRATOR PRO: XENSERVER TO PROXMOX (IMPORT & CONVERT)
-# Versão: 1.6 (Smart Temp Storage Selection)
+# Versão: 1.7 (Smart Space Allocation & ISO Storage Support)
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -47,8 +47,9 @@ check_dependencies() {
         cp xva-img /usr/local/bin/
         chmod +x /usr/local/bin/xva-img
     fi
-    if ! command -v pv &> /dev/null; then apt-get install -y pv -qq; fi
-    if ! command -v numfmt &> /dev/null; then apt-get install -y coreutils -qq; fi
+    for cmd in pv numfmt; do
+        if ! command -v $cmd &> /dev/null; then apt-get install -y coreutils pv -qq; fi
+    done
     log "Dependências OK." "SUCCESS"
 }
 
@@ -65,6 +66,30 @@ configure_bridge_vlan() {
         ifreload -a
         log "Rede atualizada." "SUCCESS"
     fi
+}
+
+# --- FUNÇÕES DE ANÁLISE ---
+
+analyze_xva_size() {
+    log "Analisando tamanho necessário para descompactação..."
+    
+    # Extrai apenas o ova.xml para /tmp (RAM) para leitura rápida
+    EXTRACT_TMP="/tmp/xva_analysis_$$"
+    mkdir -p "$EXTRACT_TMP"
+    tar -xf "$XVA_FILE" -C "$EXTRACT_TMP" ova.xml 2>/dev/null
+    
+    if [ ! -f "$EXTRACT_TMP/ova.xml" ]; then
+        log "AVISO: Metadados não legíveis. Estimando (Tamanho XVA x2)..." "WARN"
+        TOTAL_REQ_BYTES=$(($(stat -c%s "$XVA_FILE") * 2))
+    else
+        # Soma o tamanho virtual de todos os discos no XML
+        TOTAL_REQ_BYTES=$(grep "virtual_size" "$EXTRACT_TMP/ova.xml" | awk -F'"' '{s+=$2} END {print s}')
+    fi
+    rm -rf "$EXTRACT_TMP"
+    
+    REQ_GB=$((TOTAL_REQ_BYTES / 1024 / 1024 / 1024))
+    REQ_HUMAN=$(numfmt --to=iec --suffix=B $TOTAL_REQ_BYTES)
+    log "Espaço Necessário Estimado: $REQ_HUMAN (~$REQ_GB GB)" "INFO"
 }
 
 # --- FUNÇÕES DE FONTE ---
@@ -134,6 +159,9 @@ select_file() {
     XVA_FILE="${FILES[$((file_opt-1))]}"
     VM_NAME_RAW=$(basename "$XVA_FILE" .xva)
     CLEAN_NAME=$(echo "$VM_NAME_RAW" | sed -E 's/_[0-9]{4}-[0-9]{2}-[0-9]{2}.*$//' | tr '_' '-')
+    
+    # ANÁLISE IMEDIATA DE TAMANHO
+    analyze_xva_size
 }
 
 parse_audit_data() {
@@ -161,48 +189,7 @@ parse_audit_data() {
     fi
 }
 
-validate_host_resources() {
-    HOST_FREE_RAM=$(free -m | awk '/^Mem:/{print $7}')
-    if [ "$SUGGEST_RAM" -gt "$HOST_FREE_RAM" ]; then
-        log "ALERTA: Host tem pouca RAM (${HOST_FREE_RAM}MB) para esta VM (${SUGGEST_RAM}MB)." "WARN"
-        read -p "Continuar? [y/N]: " force_ram; [[ ! "$force_ram" =~ ^[yY]$ ]] && exit 1
-    fi
-}
-
-check_disk_space() {
-    local target_dir=$1
-    log "Calculando tamanho REAL do disco (extraindo metadados)..."
-    
-    mkdir -p "$target_dir"
-    tar -xf "$XVA_FILE" -C "$target_dir" ova.xml 2>/dev/null
-    
-    if [ ! -f "$target_dir/ova.xml" ]; then
-        log "AVISO: Não foi possível ler metadados. Estimando x2..." "WARN"
-        TOTAL_REQ_BYTES=$(($(stat -c%s "$XVA_FILE") * 2))
-    else
-        TOTAL_REQ_BYTES=$(grep "virtual_size" "$target_dir/ova.xml" | awk -F'"' '{s+=$2} END {print s}')
-        rm -f "$target_dir/ova.xml"
-    fi
-    
-    # Verifica espaço no caminho escolhido
-    AVAIL_BYTES=$(df --output=avail -B1 "$target_dir" | tail -1)
-    
-    REQ_GB=$((TOTAL_REQ_BYTES / 1024 / 1024 / 1024))
-    AVAIL_GB=$((AVAIL_BYTES / 1024 / 1024 / 1024))
-    
-    log "Espaço Necessário (Expandido): ~${REQ_GB} GB"
-    log "Espaço Disponível em $target_dir: ${AVAIL_GB} GB"
-    
-    if [ "$TOTAL_REQ_BYTES" -gt "$AVAIL_BYTES" ]; then
-        log "CRITICAL: Espaço insuficiente em $target_dir!" "ERROR"
-        log "A conversão falhará. Escolha um storage maior (ex: os 4TB) ou o USB."
-        exit 1
-    else
-        log "Espaço OK. Prosseguindo." "SUCCESS"
-    fi
-}
-
-configure_vm() {
+configure_vm_and_storage() {
     echo ""
     log "--- CONFIGURAÇÃO ---"
     
@@ -210,68 +197,91 @@ configure_vm() {
     read -p "ID VM [$NEXT_ID]: " VMID; VMID=${VMID:-$NEXT_ID}
     read -p "Nome [$CLEAN_NAME]: " VMNAME; VMNAME=${VMNAME:-$CLEAN_NAME}; VMNAME=$(echo "$VMNAME" | tr '_' '-')
     
-    validate_host_resources
-    
-    # --- STORAGE DE DESTINO (ONDE A VM VAI MORAR) ---
-    echo ""; log "Selecione o Storage de Destino (Onde a VM vai ficar):"
+    # --- STORAGE DE DESTINO ---
+    echo ""; log "Selecione o Storage FINAL (Onde a VM vai morar):"
     mapfile -t STORAGES < <(pvesm status -enabled | awk 'NR>1 {print $1}')
-    [ ${#STORAGES[@]} -eq 0 ] && { log "Sem storage!" "ERROR"; exit 1; }
-
     i=1
     for store in "${STORAGES[@]}"; do
         size_kb=$(pvesm status -storage "$store" | awk 'NR==2 {print $6}')
         size_human=$(numfmt --from-unit=1024 --to=iec $size_kb 2>/dev/null || echo "${size_kb}KB")
-        type=$(pvesm status -storage "$store" | awk 'NR==2 {print $2}')
-        echo "  [$i] $store (Tipo: $type | Livre: $size_human)"
+        echo "  [$i] $store (Livre: $size_human)"
         ((i++))
     done
     read -p "Opção: " store_opt; TARGET_STORAGE="${STORAGES[$((store_opt-1))]}"
     [ -z "$TARGET_STORAGE" ] && TARGET_STORAGE="local-lvm"
 
-    # --- NOVO MENU: STORAGE TEMPORÁRIO (ONDE VAMOS TRABALHAR) ---
-    echo ""; log "Selecione o Local Temporário para Conversão (.raw):"
-    echo "  [1] Usar o HD Externo (Seguro - Espaço do USB)"
-    echo "  [2] Partição do Sistema (Rápido - Cuidado! Apenas 100GB)"
-    
-    # Busca Storages que suportam arquivos (Directory/ZFS) para usar o espaço deles
-    mapfile -t FILE_STORAGES < <(pvesm status -content images -enabled | awk 'NR>1 {print $1}')
-    idx=3
-    declare -a STORAGE_PATHS
-    
-    for fs_store in "${FILE_STORAGES[@]}"; do
-        path=$(pvesm path "$fs_store" "$VMID" 2>/dev/null | xargs dirname 2>/dev/null)
-        # Se pvesm path falhar, tenta pegar config dir
-        if [ -z "$path" ]; then
-             path=$(grep -A5 "^dir: $fs_store" /etc/pve/storage.cfg | grep "path" | awk '{print $2}')
+    # --- SELEÇÃO DE LOCAL TEMPORÁRIO COM VALIDAÇÃO ---
+    while true; do
+        echo ""
+        log "SELECIONE ONDE PROCESSAR OS ARQUIVOS TEMPORÁRIOS (.raw)"
+        log "Necessário: $REQ_HUMAN livres."
+        echo "---------------------------------------------------------"
+        
+        # Opção 1: USB
+        usb_free=$(df --output=avail -B1 "$MOUNT_POINT" | tail -1)
+        usb_human=$(numfmt --to=iec --suffix=B $usb_free)
+        echo "  [1] HD USB Externo (Livre: $usb_human)"
+        
+        # Opção 2: Root
+        root_free=$(df --output=avail -B1 "$TEMP_DIR_ROOT" | tail -1)
+        root_human=$(numfmt --to=iec --suffix=B $root_free)
+        echo "  [2] Partição Root/Local (Livre: $root_human)"
+        
+        # Opções 3+: Storages do Proxmox
+        mapfile -t FILE_STORAGES < <(pvesm status -content iso,backup,images -enabled | awk 'NR>1 {print $1}')
+        declare -a STORAGE_PATHS
+        idx=3
+        
+        for fs_store in "${FILE_STORAGES[@]}"; do
+            # Tenta obter o caminho físico do storage
+            path=$(pvesm path "$fs_store" "tmp_check" 2>/dev/null | xargs dirname 2>/dev/null)
+            # Fallback para config
+            if [ -z "$path" ]; then
+                 path=$(grep -A5 "^dir: $fs_store" /etc/pve/storage.cfg | grep "path" | awk '{print $2}')
+            fi
+            
+            if [ -n "$path" ] && [ -d "$path" ]; then
+                store_free=$(df --output=avail -B1 "$path" | tail -1)
+                store_human=$(numfmt --to=iec --suffix=B $store_free)
+                echo "  [$idx] Storage: $fs_store (Livre: $store_human)"
+                STORAGE_PATHS[$idx]="$path"
+                ((idx++))
+            fi
+        done
+        echo "---------------------------------------------------------"
+        
+        read -p "Escolha um local com espaço suficiente: " temp_opt
+        temp_opt=${temp_opt:-1}
+        
+        SELECTED_PATH=""
+        SELECTED_FREE=0
+        
+        if [ "$temp_opt" == "1" ]; then
+            SELECTED_PATH="$MOUNT_POINT/temp_conversion"
+            SELECTED_FREE=$usb_free
+        elif [ "$temp_opt" == "2" ]; then
+            SELECTED_PATH="$TEMP_DIR_ROOT"
+            SELECTED_FREE=$root_free
+        elif [ -n "${STORAGE_PATHS[$temp_opt]}" ]; then
+            SELECTED_PATH="${STORAGE_PATHS[$temp_opt]}/temp_xva_import"
+            SELECTED_FREE=$(df --output=avail -B1 "${STORAGE_PATHS[$temp_opt]}" | tail -1)
+        else
+            log "Opção inválida." "ERROR"
+            continue
         fi
         
-        # Só mostra se achou um caminho válido e gravável
-        if [ -n "$path" ] && [ -d "$path" ]; then
-            avail=$(df -h "$path" | awk 'NR==2 {print $4}')
-            echo "  [$idx] Storage Proxmox: $fs_store (Livre: $avail)"
-            STORAGE_PATHS[$idx]="$path/temp_xva"
-            ((idx++))
+        # Validação
+        if [ "$TOTAL_REQ_BYTES" -gt "$SELECTED_FREE" ]; then
+            log "ERRO: O local escolhido tem apenas $(numfmt --to=iec --suffix=B $SELECTED_FREE) livres." "ERROR"
+            log "Você precisa de $REQ_HUMAN. Escolha outra opção!" "WARN"
+            sleep 2
+        else
+            WORK_DIR="$SELECTED_PATH"
+            mkdir -p "$WORK_DIR"
+            log "Local temporário aprovado: $WORK_DIR" "SUCCESS"
+            break
         fi
     done
-    
-    read -p "Opção [1]: " temp_opt
-    temp_opt=${temp_opt:-1}
-    
-    if [ "$temp_opt" == "1" ]; then
-        WORK_DIR="$MOUNT_POINT/temp_conversion"
-    elif [ "$temp_opt" == "2" ]; then
-        WORK_DIR="$TEMP_DIR_ROOT"
-    elif [ -n "${STORAGE_PATHS[$temp_opt]}" ]; then
-        WORK_DIR="${STORAGE_PATHS[$temp_opt]}"
-        log "Usando storage do Proxmox: $WORK_DIR" "INFO"
-    else
-        log "Opção inválida. Usando USB." "WARN"
-        WORK_DIR="$MOUNT_POINT/temp_conversion"
-    fi
-    mkdir -p "$WORK_DIR"
-    
-    # Valida espaço no local escolhido
-    check_disk_space "$WORK_DIR"
     
     # --- REDE ---
     echo ""; log "Selecione a Bridge de Rede:"
@@ -335,12 +345,12 @@ run_import() {
 # --- EXECUÇÃO ---
 clear
 log "==============================================="
-log "   XEN TO PROXMOX - IMPORT WIZARD v1.6"
+log "   XEN TO PROXMOX - IMPORT WIZARD v1.7"
 log "==============================================="
 
 check_dependencies
 select_source
 select_file
 parse_audit_data
-configure_vm
+configure_vm_and_storage
 run_import
