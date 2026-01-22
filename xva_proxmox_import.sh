@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # MIGRATOR PRO: XENSERVER TO PROXMOX (IMPORT & CONVERT)
-# Versão: 2.1 (Safe Cancel & Atomic Logging)
+# Versão: 2.2 (Smart ID Tracking & Batch Safety)
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -58,11 +58,11 @@ cleanup_on_cancel() {
     log "!!! INTERRUPÇÃO DETECTADA (CTRL+C) !!!" "ERROR"
     log "Iniciando protocolo de limpeza de emergência..." "WARN"
     
-    # 1. Matar processos filhos (tar, xva-img, qm import)
+    # 1. Matar processos filhos
     log "   -> Parando processos ativos..."
     pkill -P $$ 2>/dev/null
     
-    # 2. Remover VM incompleta (apenas se estava sendo criada)
+    # 2. Remover VM incompleta
     if [ -n "$CURRENT_VMID" ]; then
         if qm status "$CURRENT_VMID" &>/dev/null; then
             log "   -> Removendo VM incompleta (ID $CURRENT_VMID)..."
@@ -71,7 +71,7 @@ cleanup_on_cancel() {
         fi
     fi
     
-    # 3. Limpar arquivos temporários da extração atual
+    # 3. Limpar arquivos temporários
     if [ -n "$CURRENT_WORK_DIR" ] && [ -d "$CURRENT_WORK_DIR" ]; then
         log "   -> Removendo arquivos temporários parciais em: $CURRENT_WORK_DIR"
         rm -rf "$CURRENT_WORK_DIR"
@@ -79,7 +79,6 @@ cleanup_on_cancel() {
     fi
     
     log "Limpeza concluída. O estado anterior foi restaurado." "SUCCESS"
-    log "Processo abortado pelo usuário." "ERROR"
     exit 1
 }
 
@@ -212,7 +211,7 @@ select_files_batch() {
     ESTIMATED_MAX_HUMAN=$(numfmt --to=iec --suffix=B $ESTIMATED_MAX_RAW)
 }
 
-# --- SELEÇÃO DE ESPAÇO TEMPORÁRIO ---
+# --- SELEÇÃO DE ESPAÇO TEMPORÁRIO (GLOBAL) ---
 
 select_temp_storage_global() {
     echo ""
@@ -220,17 +219,14 @@ select_temp_storage_global() {
     log "Requisito (Maior VM): ~$ESTIMATED_MAX_HUMAN livres."
     echo "---------------------------------------------------------"
     
-    # Opção 1: USB
     usb_free=$(df --output=avail -B1 "$MOUNT_POINT" | tail -1)
     usb_human=$(numfmt --to=iec --suffix=B $usb_free)
     echo "  [1] HD USB Externo (Livre: $usb_human)"
     
-    # Opção 2: Root
     root_free=$(df --output=avail -B1 "$TEMP_DIR_ROOT" | tail -1)
     root_human=$(numfmt --to=iec --suffix=B $root_free)
     echo "  [2] Partição Root/Local (Livre: $root_human)"
     
-    # Opções 3+: Storages do Proxmox
     mapfile -t FILE_STORAGES < <(pvesm status -content images,iso,backup,rootdir -enabled | awk 'NR>1 {print $1}')
     declare -a STORAGE_PATHS
     idx=3
@@ -282,13 +278,16 @@ select_temp_storage_global() {
     log "Diretório temporário definido: $WORK_DIR_BASE" "SUCCESS"
 }
 
-# --- CONFIGURAÇÃO DAS VMS ---
+# --- CONFIGURAÇÃO DAS VMS (LOOP) ---
 
 configure_batch() {
     clear
     log "==============================================="
     log "   ETAPA DE CONFIGURAÇÃO (Batch Mode)"
     log "==============================================="
+    
+    # ARRAY PARA CONTROLAR IDs JÁ USADOS NESTE LOTE
+    declare -a RESERVED_IDS
     
     counter=0
     for XVA_FILE in "${BATCH_FILES[@]}"; do
@@ -319,8 +318,20 @@ configure_batch() {
             done < "$AUDIT_FILE"
         fi
         
+        # --- LÓGICA DE SUGESTÃO DE ID INTELIGENTE ---
         NEXT_ID=$(pvesh get /cluster/nextid)
-        read -p "   ID VM [$NEXT_ID]: " VMID; VMID=${VMID:-$NEXT_ID}
+        
+        # Se o NEXT_ID já está na nossa lista de reservados, incrementa até achar um livre
+        while [[ " ${RESERVED_IDS[*]} " =~ " ${NEXT_ID} " ]]; do
+            ((NEXT_ID++))
+        done
+        
+        read -p "   ID VM [$NEXT_ID]: " VMID
+        VMID=${VMID:-$NEXT_ID}
+        
+        # Adiciona o ID escolhido na lista de reservados
+        RESERVED_IDS+=("$VMID")
+        
         read -p "   Nome [$CLEAN_NAME]: " VMNAME; VMNAME=${VMNAME:-$CLEAN_NAME}; VMNAME=$(echo "$VMNAME" | tr '_' '-')
         
         echo "   Hardware: ${SUGGEST_CPU} vCPUs | ${SUGGEST_RAM} MB RAM"
@@ -376,7 +387,6 @@ run_batch() {
     for CONFIG in "${BATCH_CONFIGS[@]}"; do
         IFS='|' read -r XVA_FILE VMID VMNAME CPU RAM TARGET BRIDGE USE_VLAN MACS_STR VLANS_STR <<< "$CONFIG"
         
-        # Define variáveis globais para o Trap
         CURRENT_VMID="$VMID"
         CURRENT_WORK_DIR="$WORK_DIR_BASE/current_vm_${VMID}"
         CURRENT_STEP="Iniciando"
@@ -386,14 +396,12 @@ run_batch() {
         log "    Arquivo: $(basename "$XVA_FILE")"
         log "    Alvo: $TARGET"
         
-        # 1. Cria VM
         CURRENT_STEP="Criando VM"
         if ! qm create $VMID --name "$VMNAME" --memory $RAM --cores $CPU --ostype l26 --scsihw virtio-scsi-pci; then
             log "ERRO: Falha ao criar VM $VMID. Pulando..." "ERROR"
             ((idx++)); CURRENT_VMID=""; continue
         fi
         
-        # 2. Rede
         IFS=',' read -r -a MACS <<< "$MACS_STR"
         IFS=',' read -r -a VLANS <<< "$VLANS_STR"
         
@@ -410,7 +418,6 @@ run_batch() {
             done
         fi
         
-        # 3. Conversão
         CURRENT_STEP="Convertendo RAW"
         rm -rf "$CURRENT_WORK_DIR" 2>/dev/null
         mkdir -p "$CURRENT_WORK_DIR"
@@ -426,13 +433,11 @@ run_batch() {
         
         if [ ! -f "$CURRENT_WORK_DIR/disk.raw" ]; then log "ERRO: Conversão falhou." "ERROR"; ((idx++)); CURRENT_VMID=""; continue; fi
         
-        # 4. Importação
         CURRENT_STEP="Importando Disco"
         log "    Importando para $TARGET..."
         if ! qm importdisk $VMID "$CURRENT_WORK_DIR/disk.raw" $TARGET --format raw; then
             log "ERRO: Falha no qm importdisk." "ERROR"; ((idx++)); CURRENT_VMID=""; continue; fi
         
-        # 5. Anexar
         IMPORTED_DISK=$(qm config $VMID | grep unused | head -n 1 | awk '{print $2}')
         if [ -n "$IMPORTED_DISK" ]; then
             qm set $VMID --scsi0 $IMPORTED_DISK,ssd=1
@@ -440,14 +445,11 @@ run_batch() {
             qm set $VMID --agent 1
         fi
         
-        # 6. Limpeza
         CURRENT_STEP="Limpando"
         log "    Limpando temporários..."
         rm -rf "$CURRENT_WORK_DIR"
         
         log "    [SUCESSO] VM $VMID concluída." "SUCCESS"
-        
-        # Reseta variáveis de controle para evitar deleção acidental
         CURRENT_VMID=""
         CURRENT_WORK_DIR=""
         ((idx++))
@@ -461,7 +463,7 @@ run_batch() {
 # --- EXECUÇÃO ---
 clear
 log "==============================================="
-log "   XEN TO PROXMOX - IMPORT WIZARD v2.1"
+log "   XEN TO PROXMOX - IMPORT WIZARD v2.2"
 log "==============================================="
 
 check_dependencies
