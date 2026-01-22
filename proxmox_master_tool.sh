@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-# PROXMOX MASTER SUITE V2.1
-# Fix: Reintrodução de Auditoria e Snapshots Separados
+# PROXMOX MASTER SUITE V2.2
+# Funcionalidades: Backup, Restore, Audit, Snapshots & LXC Dev Suite
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -183,7 +183,7 @@ run_import() {
     if [ $? -eq 0 ]; then log "SUCESSO! VM Restaurada." "SUCCESS"; else log "ERRO na restauração." "ERROR"; fi
 }
 
-# --- 4. CONFIGURAÇÕES DO HOST (EXPORT/IMPORT) ---
+# --- 4. CONFIGURAÇÕES DO HOST ---
 
 export_host_config() {
     detect_storage "DESTINO PARA EXPORTAR CONFIGS DO HOST:"
@@ -225,7 +225,6 @@ import_host_config() {
     tar -xf "$CONF_FILE" -C "$TMP_IMPORT"
     
     log "MODO INTERATIVO DE IMPORTAÇÃO"
-    log "Você verá a configuração importada e poderá editá-la antes de aplicar."
     read -p "Pressione ENTER para revisar a REDE (/etc/network/interfaces)..."
     
     nano "$TMP_IMPORT/etc_network/interfaces"
@@ -236,7 +235,7 @@ import_host_config() {
     echo ""
     log "Deseja aplicar esta configuração de rede?" "WARN"
     log "[1] Sim, aplicar e reiniciar rede (ifreload)"
-    log "[2] Sim, aplicar mas NÃO reiniciar (reboot manual necessário)"
+    log "[2] Sim, aplicar mas NÃO reiniciar"
     log "[3] Não aplicar rede"
     read -p "Opção: " net_opt
     
@@ -257,12 +256,11 @@ import_host_config() {
         cp "$TMP_IMPORT/etc_pve/user.cfg" /etc/pve/user.cfg
         log "Storages e Usuários atualizados." "SUCCESS"
     fi
-    
     rm -rf "$TMP_IMPORT"
     log "Importação finalizada."
 }
 
-# --- 5. OTIMIZAÇÃO (WIZARD) ---
+# --- 5. OTIMIZAÇÃO ---
 
 optimize_proxmox() {
     clear
@@ -281,8 +279,8 @@ optimize_proxmox() {
     fi
     
     echo ""
-    log "[2] Otimizar Uso de RAM (Swappiness)"
-    read -p "Definir swappiness=10? [y/N]: " swap_opt
+    log "[2] Otimizar Uso de RAM (Swappiness = 10)"
+    read -p "Aplicar? [y/N]: " swap_opt
     if [[ "$swap_opt" =~ ^[yY]$ ]]; then
         sysctl vm.swappiness=10
         echo "vm.swappiness=10" > /etc/sysctl.d/99-swappiness.conf
@@ -304,14 +302,14 @@ optimize_proxmox() {
     read -p "Enter para voltar..."
 }
 
-# --- 6. LXC GIT BUILDER ---
+# --- 6. LXC GIT BUILDER (V2.2 - MULTI STACK) ---
 
 create_lxc_git() {
-    log "--- CRIADOR DE LXC VIA GIT ---"
+    log "--- CRIADOR DE LXC DEV (MULTI-STACK) ---"
     
     read -p "ID do Container [ex: 200]: " CTID
-    read -p "Hostname [ex: web-app]: " CTHOST
-    read -p "Senha do Root: " CTPASS
+    read -p "Hostname [ex: dev-server]: " CTHOST
+    read -p "Senha do Root (SSH): " CTPASS
     read -p "URL do Git [https://...]: " GIT_URL
     
     log "Buscando templates em local:vztmpl..."
@@ -329,47 +327,105 @@ create_lxc_git() {
         pveam download local "$TEMPLATE"
     fi
     
-    log "Selecione o Storage para o disco do Container:"
+    log "Selecione o Storage para o disco:"
     mapfile -t STORAGES < <(pvesm status -content rootdir -enabled | awk 'NR>1 {print $1}')
     i=1; for s in "${STORAGES[@]}"; do echo "  [$i] $s"; ((i++)); done
     read -p "Opção: " s_opt
     TARGET_STORAGE="${STORAGES[$((s_opt-1))]}"
     
-    log "Criando Container LXC Otimizado..."
+    # Criação do Container
+    # Adicionado keyctl=1 para Docker funcionar
+    log "Criando Container LXC (Nesting=1, Keyctl=1)..."
     pct create $CTID "local:vztmpl/$(basename "$TEMPLATE")" \
         --hostname "$CTHOST" --password "$CTPASS" \
-        --storage "$TARGET_STORAGE" --rootfs 8 \
+        --storage "$TARGET_STORAGE" --rootfs 10 \
         --cores $(nproc) --memory 2048 --swap 512 \
         --net0 name=eth0,bridge=vmbr0,ip=dhcp,type=veth \
-        --features nesting=1 \
+        --features nesting=1,keyctl=1 \
         --onboot 1 \
         --start 1
         
-    log "Container criado e iniciado. Aguardando rede..."
-    sleep 10
+    log "Container iniciado. Aguardando rede..."
+    sleep 8
     
-    log "Atualizando e instalando Git..."
+    log "Atualizando base do sistema..."
     pct exec $CTID -- apt-get update
-    pct exec $CTID -- apt-get install -y git curl build-essential
+    pct exec $CTID -- apt-get install -y git curl build-essential openssh-server
     
-    log "Clonando repositório..."
-    pct exec $CTID -- git clone "$GIT_URL" /var/www/project
+    # CONFIGURAÇÃO SSH (Permitir Root)
+    log "Configurando SSH para permitir root..."
+    pct exec $CTID -- sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    pct exec $CTID -- systemctl enable ssh
+    pct exec $CTID -- systemctl restart ssh
     
+    # CLONE GIT
+    log "Clonando projeto..."
+    PROJECT_DIR="/var/www/project"
+    pct exec $CTID -- git clone "$GIT_URL" "$PROJECT_DIR"
+    
+    # INSTALAÇÃO DE STACKS (MULTI-SELEÇÃO)
     echo ""
-    log "Deseja instalar uma stack de linguagem?"
+    log "SELECIONE AS STACKS PARA INSTALAR (Separadas por espaço)"
+    echo "Exemplo: 1 3 5 (Instala Node, Nginx e Docker)"
+    echo "----------------------------------------------"
     echo "  [1] NodeJS (LTS)"
     echo "  [2] Python 3 + Pip"
-    echo "  [3] PHP + Apache"
-    echo "  [0] Nenhuma (Apenas Git)"
-    read -p "Opção: " stack_opt
+    echo "  [3] Nginx Web Server"
+    echo "  [4] PHP + Apache"
+    echo "  [5] Docker + Docker Compose"
+    echo "  [6] Rust (Cargo)"
+    echo "  [7] CMake & Make Tools"
+    echo "----------------------------------------------"
+    read -p "Seleção: " stack_sel
     
-    case $stack_opt in
-        1) pct exec $CTID -- bash -c "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs" ;;
-        2) pct exec $CTID -- apt-get install -y python3 python3-pip python3-venv ;;
-        3) pct exec $CTID -- apt-get install -y php apache2 libapache2-mod-php ;;
-    esac
+    for opt in $stack_sel; do
+        case $opt in
+            1) 
+                log ">> Instalando NodeJS..."
+                pct exec $CTID -- bash -c "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs" 
+                ;;
+            2) 
+                log ">> Instalando Python 3..."
+                pct exec $CTID -- apt-get install -y python3 python3-pip python3-venv 
+                ;;
+            3) 
+                log ">> Instalando Nginx..."
+                pct exec $CTID -- apt-get install -y nginx 
+                ;;
+            4) 
+                log ">> Instalando PHP/Apache..."
+                pct exec $CTID -- apt-get install -y php apache2 libapache2-mod-php 
+                ;;
+            5) 
+                log ">> Instalando Docker..."
+                pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh" 
+                ;;
+            6) 
+                log ">> Instalando Rust..."
+                pct exec $CTID -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" 
+                ;;
+            7) 
+                log ">> Instalando Build Tools..."
+                pct exec $CTID -- apt-get install -y cmake make g++ 
+                ;;
+        esac
+    done
     
-    log "LXC $CTID Configurado com sucesso!" "SUCCESS"
+    # RELATÓRIO FINAL
+    CT_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
+    clear
+    log "==============================================="
+    log "   LXC DEPLOYMENT FINALIZADO" "SUCCESS"
+    log "==============================================="
+    echo "  Container ID : $CTID"
+    echo "  Hostname     : $CTHOST"
+    echo "  IP Address   : $CT_IP (DHCP)"
+    echo "  Usuário      : root"
+    echo "  Senha        : $CTPASS"
+    echo "  SSH Acesso   : ssh root@$CT_IP"
+    echo "  Projeto Git  : $PROJECT_DIR"
+    echo "==============================================="
+    read -p "Pressione ENTER para voltar..."
 }
 
 # --- 7. AUDITORIA COMPLETA ---
@@ -466,14 +522,14 @@ manage_snapshots() {
 show_menu() {
     clear
     log "==============================================="
-    log "   PROXMOX MASTER SUITE v2.1 (HOST: $HOSTNAME)"
+    log "   PROXMOX MASTER SUITE v2.2 (HOST: $HOSTNAME)"
     log "==============================================="
     echo "  [1] EXPORTAR VMs (Backup com Nome da VM)"
     echo "  [2] IMPORTAR VMs (Restaurar Backup)"
     echo "  [3] EXPORTAR Configurações do Host"
     echo "  [4] IMPORTAR Configurações do Host (Interativo)"
     echo "  [5] PROXMOX OPTIMIZER (Wizard de Performance)"
-    echo "  [6] CRIAR LXC via GIT (Auto-Install)"
+    echo "  [6] CRIAR LXC via GIT (Multi-Stack Dev Env)"
     echo "  [7] AUDITORIA COMPLETA"
     echo "  [8] GERENCIAR SNAPSHOTS"
     echo "  [9] SAIR"
