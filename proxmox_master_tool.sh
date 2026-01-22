@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-# PROXMOX MASTER TOOL - SUITE V2.0
-# Gerenciamento, Backup, Restore, Auditoria, Otimização e LXC
+# PROXMOX MASTER SUITE V2.1
+# Fix: Reintrodução de Auditoria e Snapshots Separados
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -91,7 +91,6 @@ run_export() {
     detect_storage "SELECIONE O DESTINO DO BACKUP:"
     log "--- EXPORTAÇÃO DE VMS ---"
     
-    # Seleção de VMs
     qm list
     echo "-------------------------------------"
     echo "Digite IDs (separados por espaço) ou 'ALL':"
@@ -115,18 +114,14 @@ run_export() {
     for vmid in "${TARGET_VMS[@]}"; do
         vmname=$(qm config $vmid | grep "name:" | awk '{print $2}')
         [ -z "$vmname" ] && vmname="VM$vmid"
-        clean_vmname=$(echo "$vmname" | tr -dc '[:alnum:]\-\_') # Sanitize name
+        clean_vmname=$(echo "$vmname" | tr -dc '[:alnum:]\-\_')
         
         echo ""
         log ">>> Exportando $idx/$total: $vmid ($vmname)"
         
-        # Executa vzdump
-        # Captura o nome do arquivo gerado através do stdout se possível, ou busca o mais recente
         vzdump $vmid --dumpdir "$WORK_DIR" --mode $BKP_MODE --compress zstd
         
         if [ $? -eq 0 ]; then
-            # RENOMEAR ARQUIVO PARA INCLUIR NOME DA VM
-            # Busca o arquivo mais recente criado nos últimos 2 minutos que contenha o ID
             LATEST_FILE=$(find "$WORK_DIR" -maxdepth 1 -name "vzdump-qemu-$vmid-*.vma.zst" -mmin -2 | sort -r | head -n 1)
             
             if [ -f "$LATEST_FILE" ]; then
@@ -198,14 +193,12 @@ export_host_config() {
     TMP_DIR="/tmp/pve_export_conf_$$"
     mkdir -p "$TMP_DIR/etc_network" "$TMP_DIR/etc_pve"
     
-    # Arquivos críticos
     cp /etc/network/interfaces "$TMP_DIR/etc_network/" 2>/dev/null
     cp /etc/hosts "$TMP_DIR/" 2>/dev/null
     cp /etc/resolv.conf "$TMP_DIR/" 2>/dev/null
     cp /etc/pve/storage.cfg "$TMP_DIR/etc_pve/" 2>/dev/null
     cp /etc/pve/user.cfg "$TMP_DIR/etc_pve/" 2>/dev/null
     
-    # Auditoria extra
     lsblk > "$TMP_DIR/disk_layout.txt"
     ip addr > "$TMP_DIR/ip_addr.txt"
     
@@ -235,7 +228,6 @@ import_host_config() {
     log "Você verá a configuração importada e poderá editá-la antes de aplicar."
     read -p "Pressione ENTER para revisar a REDE (/etc/network/interfaces)..."
     
-    # Edição Interativa
     nano "$TMP_IMPORT/etc_network/interfaces"
     
     log "--- Comparação de Rede ---"
@@ -258,7 +250,6 @@ import_host_config() {
         fi
     fi
     
-    # Storage e Users (Cópia direta com backup)
     read -p "Deseja importar Storage e Usuários (/etc/pve/*)? [y/N]: " pve_opt
     if [[ "$pve_opt" =~ ^[yY]$ ]]; then
         cp /etc/pve/storage.cfg /etc/pve/storage.cfg.BAK
@@ -279,7 +270,6 @@ optimize_proxmox() {
     log "   PROXMOX PERFORMANCE WIZARD"
     log "==============================================="
     
-    # 1. Repositórios
     echo ""
     log "[1] Corrigir Repositórios (Remover Enterprise / Adicionar No-Subscription)"
     read -p "Aplicar? [y/N]: " repo_opt
@@ -290,10 +280,8 @@ optimize_proxmox() {
         log "Repositórios atualizados." "SUCCESS"
     fi
     
-    # 2. Swappiness
     echo ""
     log "[2] Otimizar Uso de RAM (Swappiness)"
-    log "Padrão: 60 (Usa swap cedo). Recomendado Servidor: 10 ou 1."
     read -p "Definir swappiness=10? [y/N]: " swap_opt
     if [[ "$swap_opt" =~ ^[yY]$ ]]; then
         sysctl vm.swappiness=10
@@ -301,10 +289,8 @@ optimize_proxmox() {
         log "Swappiness ajustado para 10." "SUCCESS"
     fi
     
-    # 3. CPU Governor
     echo ""
     log "[3] CPU Governor 'Performance'"
-    log "Força a CPU a trabalhar no clock máximo (evita lag de scaling)."
     read -p "Aplicar? [y/N]: " cpu_opt
     if [[ "$cpu_opt" =~ ^[yY]$ ]]; then
         apt install -y linux-cpupower
@@ -323,13 +309,11 @@ optimize_proxmox() {
 create_lxc_git() {
     log "--- CRIADOR DE LXC VIA GIT ---"
     
-    # Input Básico
     read -p "ID do Container [ex: 200]: " CTID
     read -p "Hostname [ex: web-app]: " CTHOST
     read -p "Senha do Root: " CTPASS
     read -p "URL do Git [https://...]: " GIT_URL
     
-    # Seleção de Template
     log "Buscando templates em local:vztmpl..."
     pveam update
     mapfile -t TEMPLATES < <(pveam available | grep "debian\|ubuntu" | awk '{print $2}' | sort -r | head -n 5)
@@ -340,22 +324,18 @@ create_lxc_git() {
     read -p "Escolha o template [1]: " t_opt; t_opt=${t_opt:-1}
     TEMPLATE="${TEMPLATES[$((t_opt-1))]}"
     
-    # Download se necessário
     if ! pveam list local | grep -q "$TEMPLATE"; then
         log "Baixando template $TEMPLATE..."
         pveam download local "$TEMPLATE"
     fi
     
-    # Seleção Storage
     log "Selecione o Storage para o disco do Container:"
     mapfile -t STORAGES < <(pvesm status -content rootdir -enabled | awk 'NR>1 {print $1}')
     i=1; for s in "${STORAGES[@]}"; do echo "  [$i] $s"; ((i++)); done
     read -p "Opção: " s_opt
     TARGET_STORAGE="${STORAGES[$((s_opt-1))]}"
     
-    # Criação Otimizada
     log "Criando Container LXC Otimizado..."
-    # Nesting=1 (Permite Docker dentro), Cores=Host (Performance), Swap=512
     pct create $CTID "local:vztmpl/$(basename "$TEMPLATE")" \
         --hostname "$CTHOST" --password "$CTPASS" \
         --storage "$TARGET_STORAGE" --rootfs 8 \
@@ -368,7 +348,6 @@ create_lxc_git() {
     log "Container criado e iniciado. Aguardando rede..."
     sleep 10
     
-    # Instalação via pct exec
     log "Atualizando e instalando Git..."
     pct exec $CTID -- apt-get update
     pct exec $CTID -- apt-get install -y git curl build-essential
@@ -376,7 +355,6 @@ create_lxc_git() {
     log "Clonando repositório..."
     pct exec $CTID -- git clone "$GIT_URL" /var/www/project
     
-    # Stack Helper
     echo ""
     log "Deseja instalar uma stack de linguagem?"
     echo "  [1] NodeJS (LTS)"
@@ -392,7 +370,95 @@ create_lxc_git() {
     esac
     
     log "LXC $CTID Configurado com sucesso!" "SUCCESS"
-    log "Projeto clonado em /var/www/project dentro do container."
+}
+
+# --- 7. AUDITORIA COMPLETA ---
+
+run_audit() {
+    detect_storage "SELECIONE O DESTINO DA AUDITORIA:"
+    AUDIT_DIR="$WORK_DIR/AUDITORIA_${HOSTNAME}_${DATE_NOW}"
+    mkdir -p "$AUDIT_DIR"
+    log "Iniciando Auditoria em: $AUDIT_DIR"
+    
+    mkdir -p "$AUDIT_DIR/HOST_CONFIGS/etc_network"
+    mkdir -p "$AUDIT_DIR/HOST_CONFIGS/etc_pve"
+    
+    cp /etc/network/interfaces "$AUDIT_DIR/HOST_CONFIGS/etc_network/" 2>/dev/null
+    cp /etc/hosts "$AUDIT_DIR/HOST_CONFIGS/" 2>/dev/null
+    cp /etc/pve/storage.cfg "$AUDIT_DIR/HOST_CONFIGS/etc_pve/" 2>/dev/null
+    cp /etc/pve/user.cfg "$AUDIT_DIR/HOST_CONFIGS/etc_pve/" 2>/dev/null
+    
+    pveversion -v > "$AUDIT_DIR/HOST_CONFIGS/pve_version.txt"
+    lsblk > "$AUDIT_DIR/HOST_CONFIGS/disk_layout.txt"
+    ip addr > "$AUDIT_DIR/HOST_CONFIGS/network_current_state.txt"
+    
+    tar -czf "$AUDIT_DIR/HOST_BKP_${HOSTNAME}.tar.gz" -C "$AUDIT_DIR/HOST_CONFIGS" .
+    rm -rf "$AUDIT_DIR/HOST_CONFIGS"
+    
+    log "    [OK] Configurações do Host salvas." "SUCCESS"
+    
+    log ">>> Gerando relatórios das VMs..."
+    mapfile -t VMS < <(qm list | awk 'NR>1 {print $1}')
+    
+    for vmid in "${VMS[@]}"; do
+        vmname=$(qm config $vmid | grep "name:" | awk '{print $2}')
+        [ -z "$vmname" ] && vmname="VM_$vmid"
+        REPORT_FILE="$AUDIT_DIR/VM_${vmid}_${vmname}.txt"
+        
+        echo "=== RELATÓRIO TÉCNICO: $vmname ($vmid) ===" > "$REPORT_FILE"
+        echo "Data: $DATE_NOW" >> "$REPORT_FILE"
+        echo "-------------------------------------------" >> "$REPORT_FILE"
+        echo "STATUS:" >> "$REPORT_FILE"; qm status $vmid >> "$REPORT_FILE"
+        echo "CONFIG:" >> "$REPORT_FILE"; qm config $vmid >> "$REPORT_FILE"
+        echo "DISCOS:" >> "$REPORT_FILE"; qm config $vmid | grep -E "scsi|sata|ide|virtio" >> "$REPORT_FILE"
+        echo "REDE:" >> "$REPORT_FILE"; qm config $vmid | grep "net" >> "$REPORT_FILE"
+        log "    [OK] Auditado: $vmname"
+    done
+    log "Auditoria Concluída." "SUCCESS"
+}
+
+# --- 8. GERENCIAR SNAPSHOTS ---
+
+manage_snapshots() {
+    log "--- GERENCIADOR DE SNAPSHOTS ---"
+    qm list
+    echo "-------------------------------------"
+    read -p "Digite o ID da VM alvo: " vmid
+    
+    if ! qm status $vmid &>/dev/null; then log "VM não encontrada." "ERROR"; return; fi
+    
+    echo ""
+    echo "Snapshots atuais:"
+    qm listsnapshot $vmid
+    echo "-------------------------------------"
+    echo "  [1] CRIAR Snapshot"
+    echo "  [2] RESTAURAR (Rollback)"
+    echo "  [3] DELETAR Snapshot"
+    read -p "Ação: " action
+    
+    case $action in
+        1)
+            read -p "Nome do Snapshot (sem espaços): " snap_name
+            read -p "Incluir Estado da RAM? [y/N]: " ram_opt
+            if [[ "$ram_opt" =~ ^[yY]$ ]]; then
+                qm snapshot $vmid "$snap_name" --vmstate 1
+            else
+                qm snapshot $vmid "$snap_name"
+            fi
+            log "Snapshot '$snap_name' criado." "SUCCESS"
+            ;;
+        2)
+            read -p "Nome do Snapshot para restaurar: " snap_name
+            qm rollback $vmid "$snap_name"
+            log "Rollback concluído." "SUCCESS"
+            ;;
+        3)
+            read -p "Nome do Snapshot para APAGAR: " snap_name
+            qm delsnapshot $vmid "$snap_name"
+            log "Snapshot apagado." "SUCCESS"
+            ;;
+        *) log "Opção inválida." "ERROR" ;;
+    esac
 }
 
 # --- MENU PRINCIPAL ---
@@ -400,7 +466,7 @@ create_lxc_git() {
 show_menu() {
     clear
     log "==============================================="
-    log "   PROXMOX MASTER SUITE v2.0 (HOST: $HOSTNAME)"
+    log "   PROXMOX MASTER SUITE v2.1 (HOST: $HOSTNAME)"
     log "==============================================="
     echo "  [1] EXPORTAR VMs (Backup com Nome da VM)"
     echo "  [2] IMPORTAR VMs (Restaurar Backup)"
@@ -408,8 +474,9 @@ show_menu() {
     echo "  [4] IMPORTAR Configurações do Host (Interativo)"
     echo "  [5] PROXMOX OPTIMIZER (Wizard de Performance)"
     echo "  [6] CRIAR LXC via GIT (Auto-Install)"
-    echo "  [7] AUDITORIA / SNAPSHOTS"
-    echo "  [8] SAIR"
+    echo "  [7] AUDITORIA COMPLETA"
+    echo "  [8] GERENCIAR SNAPSHOTS"
+    echo "  [9] SAIR"
     echo ""
     read -p "Opção: " opt
     case $opt in
@@ -419,11 +486,9 @@ show_menu() {
         4) import_host_config ;;
         5) optimize_proxmox ;;
         6) create_lxc_git ;;
-        7) 
-            echo "[1] Auditoria Completa  [2] Gerenciar Snapshots"
-            read -p "Sub-opção: " sub; [ "$sub" == "1" ] && detect_storage "DESTINO:" && run_audit; [ "$sub" == "2" ] && manage_snapshots
-            ;;
-        8) exit 0 ;;
+        7) run_audit ;;
+        8) manage_snapshots ;;
+        9) exit 0 ;;
         *) log "Inválido."; sleep 1; show_menu ;;
     esac
     read -p "Enter para menu..."
