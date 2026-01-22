@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # PROXMOX MASTER TOOL - EXPORT, AUDIT & MANAGE
-# Versão: 1.0
+# Versão: 1.1 (Fix Vzdump Notes Error)
 # Funcionalidades: Backup (vzdump), Auditoria Host/VM, Snapshots
 # ============================================================
 
@@ -197,12 +197,8 @@ run_export() {
         log "    Modo: $BKP_MODE | Compressão: ZSTD"
         log "    Destino: $EXPORT_DIR"
         
-        # Comando Nativo do Proxmox para Backup (vzdump)
-        # --stdouts: não usamos, queremos arquivo direto
-        # --dumpdir: define a pasta de saída (nosso USB)
-        # --compress: zstd (melhor ratio/performance)
-        
-        vzdump $vmid --dumpdir "$EXPORT_DIR" --mode $BKP_MODE --compress zstd --notes-template "Export via Master Tool em $DATE_NOW"
+        # FIX V1.1: Removido --notes-template pois causa conflito com --dumpdir (raw path)
+        vzdump $vmid --dumpdir "$EXPORT_DIR" --mode $BKP_MODE --compress zstd
         
         if [ $? -eq 0 ]; then
             log "    [SUCESSO] Backup da VM $vmid concluído." "SUCCESS"
