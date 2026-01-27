@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-# PROXMOX MASTER SUITE V2.3
-# Novidades: SSH Opcional, PHP/Apache Separados, Fix Locales
+# PROXMOX MASTER SUITE V2.4
+# Funcionalidades: Suite Completa + Importação de Config XenServer
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -183,7 +183,7 @@ run_import() {
     if [ $? -eq 0 ]; then log "SUCESSO! VM Restaurada." "SUCCESS"; else log "ERRO na restauração." "ERROR"; fi
 }
 
-# --- 4. CONFIGURAÇÕES DO HOST ---
+# --- 4. CONFIGURAÇÕES DO HOST (HÍBRIDO: PROXMOX E XEN) ---
 
 export_host_config() {
     detect_storage "DESTINO PARA EXPORTAR CONFIGS DO HOST:"
@@ -209,55 +209,158 @@ export_host_config() {
 }
 
 import_host_config() {
-    detect_storage "ORIGEM DAS CONFIGURAÇÕES DO HOST:"
-    mapfile -t FILES < <(find "$WORK_DIR" -name "HOST_CONFIG_*.tar.gz" | sort)
-    
-    if [ ${#FILES[@]} -eq 0 ]; then log "Nenhum arquivo de config encontrado."; return; fi
-    
-    echo "Arquivos disponíveis:"
-    i=1
-    for f in "${FILES[@]}"; do echo "  [$i] $(basename "$f")"; ((i++)); done
-    read -p "Selecione: " f_opt
-    CONF_FILE="${FILES[$((f_opt-1))]}"
-    
-    TMP_IMPORT="/tmp/pve_import_conf_$$"
-    mkdir -p "$TMP_IMPORT"
-    tar -xf "$CONF_FILE" -C "$TMP_IMPORT"
-    
-    log "MODO INTERATIVO DE IMPORTAÇÃO"
-    read -p "Pressione ENTER para revisar a REDE (/etc/network/interfaces)..."
-    
-    nano "$TMP_IMPORT/etc_network/interfaces"
-    
-    log "--- Comparação de Rede ---"
-    diff /etc/network/interfaces "$TMP_IMPORT/etc_network/interfaces" || echo "Diferenças encontradas (acima)."
+    detect_storage "ORIGEM DAS CONFIGURAÇÕES:"
     
     echo ""
-    log "Deseja aplicar esta configuração de rede?" "WARN"
-    log "[1] Sim, aplicar e reiniciar rede (ifreload)"
-    log "[2] Sim, aplicar mas NÃO reiniciar"
-    log "[3] Não aplicar rede"
-    read -p "Opção: " net_opt
+    log "Qual tipo de importação deseja realizar?"
+    echo "  [1] Backup Proxmox (Arquivo .tar.gz)"
+    echo "  [2] Migração XenServer (Arquivo de Auditoria .txt)"
+    read -p "Opção: " type_opt
     
-    if [ "$net_opt" == "1" ] || [ "$net_opt" == "2" ]; then
-        cp /etc/network/interfaces /etc/network/interfaces.BAK_$(date +%s)
-        cp "$TMP_IMPORT/etc_network/interfaces" /etc/network/interfaces
-        log "Arquivo de interfaces atualizado." "SUCCESS"
-        if [ "$net_opt" == "1" ]; then
-            log "Reiniciando serviços de rede..."
-            ifreload -a
+    if [ "$type_opt" == "1" ]; then
+        # === MODO PROXMOX NATIVO ===
+        mapfile -t FILES < <(find "$WORK_DIR" -name "HOST_CONFIG_*.tar.gz" | sort)
+        if [ ${#FILES[@]} -eq 0 ]; then log "Nenhum arquivo .tar.gz encontrado."; return; fi
+        
+        echo "Arquivos disponíveis:"
+        i=1
+        for f in "${FILES[@]}"; do echo "  [$i] $(basename "$f")"; ((i++)); done
+        read -p "Selecione: " f_opt
+        CONF_FILE="${FILES[$((f_opt-1))]}"
+        
+        TMP_IMPORT="/tmp/pve_import_conf_$$"
+        mkdir -p "$TMP_IMPORT"
+        tar -xf "$CONF_FILE" -C "$TMP_IMPORT"
+        
+        log "MODO INTERATIVO DE IMPORTAÇÃO"
+        read -p "Pressione ENTER para revisar a REDE (/etc/network/interfaces)..."
+        nano "$TMP_IMPORT/etc_network/interfaces"
+        
+        echo ""
+        log "Deseja aplicar esta configuração de rede?" "WARN"
+        log "[1] Sim, aplicar e reiniciar rede (ifreload)"
+        log "[2] Sim, aplicar mas NÃO reiniciar"
+        log "[3] Não aplicar rede"
+        read -p "Opção: " net_opt
+        
+        if [ "$net_opt" == "1" ] || [ "$net_opt" == "2" ]; then
+            cp /etc/network/interfaces /etc/network/interfaces.BAK_$(date +%s)
+            cp "$TMP_IMPORT/etc_network/interfaces" /etc/network/interfaces
+            if [ "$net_opt" == "1" ]; then ifreload -a; fi
         fi
+        
+        read -p "Deseja importar Storage e Usuários (/etc/pve/*)? [y/N]: " pve_opt
+        if [[ "$pve_opt" =~ ^[yY]$ ]]; then
+            cp /etc/pve/storage.cfg /etc/pve/storage.cfg.BAK
+            cp "$TMP_IMPORT/etc_pve/storage.cfg" /etc/pve/storage.cfg
+            cp "$TMP_IMPORT/etc_pve/user.cfg" /etc/pve/user.cfg
+            log "Storages e Usuários atualizados." "SUCCESS"
+        fi
+        rm -rf "$TMP_IMPORT"
+        
+    elif [ "$type_opt" == "2" ]; then
+        # === MODO MIGRAÇÃO XENSERVER ===
+        mapfile -t FILES < <(find "$WORK_DIR" -name "SERVER_*_INFO.txt" | sort)
+        if [ ${#FILES[@]} -eq 0 ]; then log "Nenhum relatório XenServer (_INFO.txt) encontrado."; return; fi
+        
+        echo "Relatórios XenServer disponíveis:"
+        i=1
+        for f in "${FILES[@]}"; do echo "  [$i] $(basename "$f")"; ((i++)); done
+        read -p "Selecione: " f_opt
+        XEN_FILE="${FILES[$((f_opt-1))]}"
+        
+        log "Lendo configurações do arquivo Xen..."
+        
+        # Extração de Dados com grep/awk
+        # Busca a interface de gerenciamento para pegar o IP principal
+        X_HOSTNAME=$(grep "name-label (" "$XEN_FILE" | head -1 | awk '{print $4}')
+        X_IP=$(grep -A 20 "management ( RO): true" "$XEN_FILE" | grep "IP ( RO):" | awk '{print $4}')
+        X_MASK=$(grep -A 20 "management ( RO): true" "$XEN_FILE" | grep "netmask ( RO):" | awk '{print $4}')
+        X_GW=$(grep -A 20 "management ( RO): true" "$XEN_FILE" | grep "gateway ( RO):" | awk '{print $4}')
+        X_DNS=$(grep -A 20 "management ( RO): true" "$XEN_FILE" | grep "DNS ( RO):" | awk '{print $4}')
+        
+        # Fallback se não achar na seção de management
+        if [ -z "$X_IP" ]; then
+             X_IP=$(grep "address ( RO):" "$XEN_FILE" | head -1 | awk '{print $4}')
+        fi
+        
+        log "--- DADOS ENCONTRADOS NO XEN ---"
+        echo "Hostname : $X_HOSTNAME"
+        echo "IP       : $X_IP"
+        echo "Máscara  : $X_MASK"
+        echo "Gateway  : $X_GW"
+        echo "DNS      : $X_DNS"
+        echo "--------------------------------"
+        
+        echo "Vamos configurar este servidor Proxmox com esses dados."
+        echo "Você pode editar os valores agora ou aceitar os padrões."
+        echo ""
+        
+        # Edição Interativa
+        read -e -p "Hostname: " -i "$X_HOSTNAME" NEW_HOSTNAME
+        read -e -p "Endereço IP (CIDR ex: /24 se necessário): " -i "$X_IP" NEW_IP
+        read -e -p "Máscara (Netmask): " -i "$X_MASK" NEW_MASK
+        read -e -p "Gateway: " -i "$X_GW" NEW_GW
+        read -e -p "DNS: " -i "$X_DNS" NEW_DNS
+        
+        # Gerar /etc/network/interfaces
+        TMP_INTERFACES="/tmp/interfaces.xen.gen"
+        cat <<EOF > "$TMP_INTERFACES"
+auto lo
+iface lo inet loopback
+
+iface eno1 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+    address $NEW_IP
+    netmask $NEW_MASK
+    gateway $NEW_GW
+    bridge-ports eno1
+    bridge-stp off
+    bridge-fd 0
+    # Configuração migrada do XenServer: $X_HOSTNAME
+
+source /etc/network/interfaces.d/*
+EOF
+        
+        log "Arquivo de rede gerado. Abrindo para revisão..."
+        read -p "Pressione ENTER para ver/editar..."
+        nano "$TMP_INTERFACES"
+        
+        echo ""
+        log "Aplicar configurações?" "WARN"
+        echo "AVISO: Isso alterará o Hostname, Hosts, DNS e Rede deste servidor."
+        read -p "Confirma? [y/N]: " confirm
+        
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            # Backup
+            cp /etc/network/interfaces /etc/network/interfaces.BAK_XEN
+            cp /etc/hosts /etc/hosts.BAK_XEN
+            cp /etc/hostname /etc/hostname.BAK_XEN
+            cp /etc/resolv.conf /etc/resolv.conf.BAK_XEN
+            
+            # Aplicar Rede
+            cp "$TMP_INTERFACES" /etc/network/interfaces
+            
+            # Aplicar Hostname
+            hostnamectl set-hostname "$NEW_HOSTNAME"
+            echo "127.0.0.1 localhost.localdomain localhost" > /etc/hosts
+            echo "$NEW_IP $NEW_HOSTNAME.local $NEW_HOSTNAME pve" >> /etc/hosts
+            
+            # Aplicar DNS
+            echo "nameserver $NEW_DNS" > /etc/resolv.conf
+            echo "search local" >> /etc/resolv.conf
+            
+            log "Configurações aplicadas com sucesso!" "SUCCESS"
+            log "Para a rede surtir efeito, reinicie ou use 'ifreload -a' (cuidado com SSH)."
+        else
+            log "Operação cancelada."
+        fi
+        rm -f "$TMP_INTERFACES"
+    else
+        log "Opção inválida."
     fi
-    
-    read -p "Deseja importar Storage e Usuários (/etc/pve/*)? [y/N]: " pve_opt
-    if [[ "$pve_opt" =~ ^[yY]$ ]]; then
-        cp /etc/pve/storage.cfg /etc/pve/storage.cfg.BAK
-        cp "$TMP_IMPORT/etc_pve/storage.cfg" /etc/pve/storage.cfg
-        cp "$TMP_IMPORT/etc_pve/user.cfg" /etc/pve/user.cfg
-        log "Storages e Usuários atualizados." "SUCCESS"
-    fi
-    rm -rf "$TMP_IMPORT"
-    log "Importação finalizada."
 }
 
 # --- 5. OTIMIZAÇÃO ---
@@ -302,21 +405,18 @@ optimize_proxmox() {
     read -p "Enter para voltar..."
 }
 
-# --- 6. LXC GIT BUILDER (V2.3 - SSH Opcional & PHP Separado) ---
+# --- 6. LXC GIT BUILDER (V2.3) ---
 
 create_lxc_git() {
     log "--- CRIADOR DE LXC DEV (MULTI-STACK) ---"
     
     read -p "ID do Container [ex: 200]: " CTID
     read -p "Hostname [ex: dev-server]: " CTHOST
-    read -p "Senha do Root (Para Console/SSH): " CTPASS
-    
-    # Pergunta SSH Opcional
+    read -p "Senha do Root (SSH): " CTPASS
     read -p "Deseja habilitar e configurar o acesso SSH para root? [y/N]: " enable_ssh
-    
     read -p "URL do Git [https://...]: " GIT_URL
     
-    log "Buscando templates em local:vztmpl..."
+    log "Buscando templates..."
     pveam update
     mapfile -t TEMPLATES < <(pveam available | grep "debian\|ubuntu" | awk '{print $2}' | sort -r | head -n 5)
     
@@ -327,17 +427,16 @@ create_lxc_git() {
     TEMPLATE="${TEMPLATES[$((t_opt-1))]}"
     
     if ! pveam list local | grep -q "$TEMPLATE"; then
-        log "Baixando template $TEMPLATE..."
         pveam download local "$TEMPLATE"
     fi
     
-    log "Selecione o Storage para o disco:"
+    log "Selecione o Storage:"
     mapfile -t STORAGES < <(pvesm status -content rootdir -enabled | awk 'NR>1 {print $1}')
     i=1; for s in "${STORAGES[@]}"; do echo "  [$i] $s"; ((i++)); done
     read -p "Opção: " s_opt
     TARGET_STORAGE="${STORAGES[$((s_opt-1))]}"
     
-    log "Criando Container LXC (Nesting=1, Keyctl=1)..."
+    log "Criando Container LXC..."
     pct create $CTID "local:vztmpl/$(basename "$TEMPLATE")" \
         --hostname "$CTHOST" --password "$CTPASS" \
         --storage "$TARGET_STORAGE" --rootfs 10 \
@@ -347,112 +446,62 @@ create_lxc_git() {
         --onboot 1 \
         --start 1
         
-    log "Container iniciado. Aguardando rede..."
+    log "Aguardando rede..."
     sleep 8
     
-    log "Atualizando base do sistema..."
-    # Configura ambiente para evitar erros de locale Perl
-    pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get update"
-    pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get install -y git curl build-essential"
+    log "Atualizando sistema..."
+    # Configura ambiente para evitar erros de locale
+    CMD_PREFIX="export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C"
+    pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get update"
+    pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y git curl build-essential"
     
-    # SSH CONFIG (CONDICIONAL)
     if [[ "$enable_ssh" =~ ^[yY]$ ]]; then
-        log "Instalando e Configurando SSH..."
-        pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get install -y openssh-server"
+        pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y openssh-server"
         pct exec $CTID -- sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
         pct exec $CTID -- systemctl enable ssh
         pct exec $CTID -- systemctl restart ssh
         SSH_STATUS="Habilitado"
     else
-        log "SSH não foi habilitado (acesso apenas via 'pct enter $CTID')."
         SSH_STATUS="Desabilitado"
     fi
     
-    # CLONE GIT
     log "Clonando projeto..."
-    PROJECT_DIR="/var/www/project"
-    pct exec $CTID -- git clone "$GIT_URL" "$PROJECT_DIR"
+    pct exec $CTID -- git clone "$GIT_URL" "/var/www/project"
     
-    # INSTALAÇÃO DE STACKS (SEPARADAS)
     echo ""
-    log "SELECIONE AS STACKS PARA INSTALAR (Separadas por espaço)"
-    echo "Exemplo: 1 3 5 (Instala Node, Nginx e PHP)"
-    echo "----------------------------------------------"
-    echo "  [1] NodeJS (LTS)"
-    echo "  [2] Python 3 + Pip"
-    echo "  [3] Nginx Web Server"
-    echo "  [4] Apache Web Server"
-    echo "  [5] PHP (CLI + FPM + Módulos Comuns)"
-    echo "  [6] Docker + Docker Compose"
-    echo "  [7] Rust (Cargo)"
-    echo "  [8] CMake & Make Tools"
-    echo "----------------------------------------------"
-    read -p "Seleção: " stack_sel
-    
-    # Export LC_ALL=C para silenciar warnings durante instalações
-    CMD_PREFIX="export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C"
+    log "STACKS PARA INSTALAR:"
+    echo "  [1] NodeJS (LTS)    [5] PHP (Full)"
+    echo "  [2] Python 3 + Pip  [6] Docker"
+    echo "  [3] Nginx           [7] Rust"
+    echo "  [4] Apache          [8] CMake"
+    read -p "Seleção (ex: 1 3 6): " stack_sel
     
     for opt in $stack_sel; do
         case $opt in
-            1) 
-                log ">> Instalando NodeJS..."
-                pct exec $CTID -- bash -c "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs" 
-                ;;
-            2) 
-                log ">> Instalando Python 3..."
-                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y python3 python3-pip python3-venv" 
-                ;;
-            3) 
-                log ">> Instalando Nginx..."
-                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y nginx" 
-                ;;
-            4) 
-                log ">> Instalando Apache..."
-                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y apache2" 
-                ;;
-            5) 
-                log ">> Instalando PHP..."
-                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y php php-cli php-fpm php-common php-mysql php-curl php-xml" 
-                ;;
-            6) 
-                log ">> Instalando Docker..."
-                pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh" 
-                ;;
-            7) 
-                log ">> Instalando Rust..."
-                pct exec $CTID -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" 
-                ;;
-            8) 
-                log ">> Instalando Build Tools..."
-                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y cmake make g++" 
-                ;;
+            1) pct exec $CTID -- bash -c "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs" ;;
+            2) pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y python3 python3-pip python3-venv" ;;
+            3) pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y nginx" ;;
+            4) pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y apache2" ;;
+            5) pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y php php-cli php-fpm php-common php-mysql php-curl" ;;
+            6) pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh" ;;
+            7) pct exec $CTID -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" ;;
+            8) pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y cmake make g++" ;;
         esac
     done
     
-    # RELATÓRIO FINAL
     CT_IP=$(pct exec $CTID -- hostname -I | awk '{print $1}')
     clear
-    log "==============================================="
-    log "   LXC DEPLOYMENT FINALIZADO" "SUCCESS"
-    log "==============================================="
-    echo "  Container ID : $CTID"
-    echo "  Hostname     : $CTHOST"
-    echo "  IP Address   : $CT_IP (DHCP)"
-    echo "  Usuário      : root"
-    echo "  Acesso Host  : pct enter $CTID"
-    echo "  SSH Status   : $SSH_STATUS"
-    echo "  Projeto Git  : $PROJECT_DIR"
-    echo "==============================================="
-    read -p "Pressione ENTER para voltar..."
+    log "LXC CRIADO: $CT_IP ($CTHOST) | SSH: $SSH_STATUS" "SUCCESS"
+    read -p "Enter..."
 }
 
 # --- 7. AUDITORIA COMPLETA ---
 
 run_audit() {
-    detect_storage "SELECIONE O DESTINO DA AUDITORIA:"
+    detect_storage "DESTINO DA AUDITORIA:"
     AUDIT_DIR="$WORK_DIR/AUDITORIA_${HOSTNAME}_${DATE_NOW}"
     mkdir -p "$AUDIT_DIR"
-    log "Iniciando Auditoria em: $AUDIT_DIR"
+    log "Auditando..."
     
     mkdir -p "$AUDIT_DIR/HOST_CONFIGS/etc_network"
     mkdir -p "$AUDIT_DIR/HOST_CONFIGS/etc_pve"
@@ -469,69 +518,41 @@ run_audit() {
     tar -czf "$AUDIT_DIR/HOST_BKP_${HOSTNAME}.tar.gz" -C "$AUDIT_DIR/HOST_CONFIGS" .
     rm -rf "$AUDIT_DIR/HOST_CONFIGS"
     
-    log "    [OK] Configurações do Host salvas." "SUCCESS"
-    
-    log ">>> Gerando relatórios das VMs..."
     mapfile -t VMS < <(qm list | awk 'NR>1 {print $1}')
-    
     for vmid in "${VMS[@]}"; do
         vmname=$(qm config $vmid | grep "name:" | awk '{print $2}')
         [ -z "$vmname" ] && vmname="VM_$vmid"
         REPORT_FILE="$AUDIT_DIR/VM_${vmid}_${vmname}.txt"
-        
-        echo "=== RELATÓRIO TÉCNICO: $vmname ($vmid) ===" > "$REPORT_FILE"
-        echo "Data: $DATE_NOW" >> "$REPORT_FILE"
-        echo "-------------------------------------------" >> "$REPORT_FILE"
-        echo "STATUS:" >> "$REPORT_FILE"; qm status $vmid >> "$REPORT_FILE"
-        echo "CONFIG:" >> "$REPORT_FILE"; qm config $vmid >> "$REPORT_FILE"
-        echo "DISCOS:" >> "$REPORT_FILE"; qm config $vmid | grep -E "scsi|sata|ide|virtio" >> "$REPORT_FILE"
-        echo "REDE:" >> "$REPORT_FILE"; qm config $vmid | grep "net" >> "$REPORT_FILE"
-        log "    [OK] Auditado: $vmname"
+        echo "=== RELATÓRIO: $vmname ===" > "$REPORT_FILE"
+        qm config $vmid >> "$REPORT_FILE"
     done
-    log "Auditoria Concluída." "SUCCESS"
+    log "Auditoria salva em $AUDIT_DIR" "SUCCESS"
 }
 
 # --- 8. GERENCIAR SNAPSHOTS ---
 
 manage_snapshots() {
-    log "--- GERENCIADOR DE SNAPSHOTS ---"
+    log "--- SNAPSHOTS ---"
     qm list
-    echo "-------------------------------------"
-    read -p "Digite o ID da VM alvo: " vmid
-    
+    read -p "ID da VM: " vmid
     if ! qm status $vmid &>/dev/null; then log "VM não encontrada." "ERROR"; return; fi
     
-    echo ""
-    echo "Snapshots atuais:"
-    qm listsnapshot $vmid
-    echo "-------------------------------------"
-    echo "  [1] CRIAR Snapshot"
-    echo "  [2] RESTAURAR (Rollback)"
-    echo "  [3] DELETAR Snapshot"
+    echo "  [1] CRIAR  [2] RESTAURAR  [3] DELETAR"
     read -p "Ação: " action
-    
     case $action in
         1)
-            read -p "Nome do Snapshot (sem espaços): " snap_name
-            read -p "Incluir Estado da RAM? [y/N]: " ram_opt
-            if [[ "$ram_opt" =~ ^[yY]$ ]]; then
-                qm snapshot $vmid "$snap_name" --vmstate 1
-            else
-                qm snapshot $vmid "$snap_name"
-            fi
-            log "Snapshot '$snap_name' criado." "SUCCESS"
-            ;;
+            read -p "Nome: " name
+            read -p "Salvar RAM? [y/N]: " ram
+            if [[ "$ram" =~ ^[yY]$ ]]; then qm snapshot $vmid "$name" --vmstate 1; else qm snapshot $vmid "$name"; fi
+            log "Criado." ;;
         2)
-            read -p "Nome do Snapshot para restaurar: " snap_name
-            qm rollback $vmid "$snap_name"
-            log "Rollback concluído." "SUCCESS"
-            ;;
+            read -p "Nome: " name
+            qm rollback $vmid "$name"
+            log "Restaurado." ;;
         3)
-            read -p "Nome do Snapshot para APAGAR: " snap_name
-            qm delsnapshot $vmid "$snap_name"
-            log "Snapshot apagado." "SUCCESS"
-            ;;
-        *) log "Opção inválida." "ERROR" ;;
+            read -p "Nome: " name
+            qm delsnapshot $vmid "$name"
+            log "Deletado." ;;
     esac
 }
 
@@ -540,14 +561,14 @@ manage_snapshots() {
 show_menu() {
     clear
     log "==============================================="
-    log "   PROXMOX MASTER SUITE v2.3 (HOST: $HOSTNAME)"
+    log "   PROXMOX MASTER SUITE v2.4 (HOST: $HOSTNAME)"
     log "==============================================="
-    echo "  [1] EXPORTAR VMs (Backup com Nome da VM)"
-    echo "  [2] IMPORTAR VMs (Restaurar Backup)"
-    echo "  [3] EXPORTAR Configurações do Host"
-    echo "  [4] IMPORTAR Configurações do Host (Interativo)"
-    echo "  [5] PROXMOX OPTIMIZER (Wizard de Performance)"
-    echo "  [6] CRIAR LXC via GIT (Multi-Stack Dev Env)"
+    echo "  [1] EXPORTAR VMs (Backup)"
+    echo "  [2] IMPORTAR VMs (Restore)"
+    echo "  [3] EXPORTAR Config Host"
+    echo "  [4] IMPORTAR Config Host (Xen/Proxmox)"
+    echo "  [5] PROXMOX OPTIMIZER"
+    echo "  [6] CRIAR LXC DEV (Git/Stack)"
     echo "  [7] AUDITORIA COMPLETA"
     echo "  [8] GERENCIAR SNAPSHOTS"
     echo "  [9] SAIR"
