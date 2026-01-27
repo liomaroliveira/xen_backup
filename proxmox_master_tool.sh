@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-# PROXMOX MASTER SUITE V2.2
-# Funcionalidades: Backup, Restore, Audit, Snapshots & LXC Dev Suite
+# PROXMOX MASTER SUITE V2.3
+# Novidades: SSH Opcional, PHP/Apache Separados, Fix Locales
 # ============================================================
 
 # --- CONFIGURAÇÕES ---
@@ -302,14 +302,18 @@ optimize_proxmox() {
     read -p "Enter para voltar..."
 }
 
-# --- 6. LXC GIT BUILDER (V2.2 - MULTI STACK) ---
+# --- 6. LXC GIT BUILDER (V2.3 - SSH Opcional & PHP Separado) ---
 
 create_lxc_git() {
     log "--- CRIADOR DE LXC DEV (MULTI-STACK) ---"
     
     read -p "ID do Container [ex: 200]: " CTID
     read -p "Hostname [ex: dev-server]: " CTHOST
-    read -p "Senha do Root (SSH): " CTPASS
+    read -p "Senha do Root (Para Console/SSH): " CTPASS
+    
+    # Pergunta SSH Opcional
+    read -p "Deseja habilitar e configurar o acesso SSH para root? [y/N]: " enable_ssh
+    
     read -p "URL do Git [https://...]: " GIT_URL
     
     log "Buscando templates em local:vztmpl..."
@@ -333,8 +337,6 @@ create_lxc_git() {
     read -p "Opção: " s_opt
     TARGET_STORAGE="${STORAGES[$((s_opt-1))]}"
     
-    # Criação do Container
-    # Adicionado keyctl=1 para Docker funcionar
     log "Criando Container LXC (Nesting=1, Keyctl=1)..."
     pct create $CTID "local:vztmpl/$(basename "$TEMPLATE")" \
         --hostname "$CTHOST" --password "$CTPASS" \
@@ -349,34 +351,46 @@ create_lxc_git() {
     sleep 8
     
     log "Atualizando base do sistema..."
-    pct exec $CTID -- apt-get update
-    pct exec $CTID -- apt-get install -y git curl build-essential openssh-server
+    # Configura ambiente para evitar erros de locale Perl
+    pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get update"
+    pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get install -y git curl build-essential"
     
-    # CONFIGURAÇÃO SSH (Permitir Root)
-    log "Configurando SSH para permitir root..."
-    pct exec $CTID -- sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-    pct exec $CTID -- systemctl enable ssh
-    pct exec $CTID -- systemctl restart ssh
+    # SSH CONFIG (CONDICIONAL)
+    if [[ "$enable_ssh" =~ ^[yY]$ ]]; then
+        log "Instalando e Configurando SSH..."
+        pct exec $CTID -- bash -c "export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C && apt-get install -y openssh-server"
+        pct exec $CTID -- sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+        pct exec $CTID -- systemctl enable ssh
+        pct exec $CTID -- systemctl restart ssh
+        SSH_STATUS="Habilitado"
+    else
+        log "SSH não foi habilitado (acesso apenas via 'pct enter $CTID')."
+        SSH_STATUS="Desabilitado"
+    fi
     
     # CLONE GIT
     log "Clonando projeto..."
     PROJECT_DIR="/var/www/project"
     pct exec $CTID -- git clone "$GIT_URL" "$PROJECT_DIR"
     
-    # INSTALAÇÃO DE STACKS (MULTI-SELEÇÃO)
+    # INSTALAÇÃO DE STACKS (SEPARADAS)
     echo ""
     log "SELECIONE AS STACKS PARA INSTALAR (Separadas por espaço)"
-    echo "Exemplo: 1 3 5 (Instala Node, Nginx e Docker)"
+    echo "Exemplo: 1 3 5 (Instala Node, Nginx e PHP)"
     echo "----------------------------------------------"
     echo "  [1] NodeJS (LTS)"
     echo "  [2] Python 3 + Pip"
     echo "  [3] Nginx Web Server"
-    echo "  [4] PHP + Apache"
-    echo "  [5] Docker + Docker Compose"
-    echo "  [6] Rust (Cargo)"
-    echo "  [7] CMake & Make Tools"
+    echo "  [4] Apache Web Server"
+    echo "  [5] PHP (CLI + FPM + Módulos Comuns)"
+    echo "  [6] Docker + Docker Compose"
+    echo "  [7] Rust (Cargo)"
+    echo "  [8] CMake & Make Tools"
     echo "----------------------------------------------"
     read -p "Seleção: " stack_sel
+    
+    # Export LC_ALL=C para silenciar warnings durante instalações
+    CMD_PREFIX="export DEBIAN_FRONTEND=noninteractive && export LC_ALL=C"
     
     for opt in $stack_sel; do
         case $opt in
@@ -386,27 +400,31 @@ create_lxc_git() {
                 ;;
             2) 
                 log ">> Instalando Python 3..."
-                pct exec $CTID -- apt-get install -y python3 python3-pip python3-venv 
+                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y python3 python3-pip python3-venv" 
                 ;;
             3) 
                 log ">> Instalando Nginx..."
-                pct exec $CTID -- apt-get install -y nginx 
+                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y nginx" 
                 ;;
             4) 
-                log ">> Instalando PHP/Apache..."
-                pct exec $CTID -- apt-get install -y php apache2 libapache2-mod-php 
+                log ">> Instalando Apache..."
+                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y apache2" 
                 ;;
             5) 
+                log ">> Instalando PHP..."
+                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y php php-cli php-fpm php-common php-mysql php-curl php-xml" 
+                ;;
+            6) 
                 log ">> Instalando Docker..."
                 pct exec $CTID -- bash -c "curl -fsSL https://get.docker.com | sh" 
                 ;;
-            6) 
+            7) 
                 log ">> Instalando Rust..."
                 pct exec $CTID -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" 
                 ;;
-            7) 
+            8) 
                 log ">> Instalando Build Tools..."
-                pct exec $CTID -- apt-get install -y cmake make g++ 
+                pct exec $CTID -- bash -c "$CMD_PREFIX && apt-get install -y cmake make g++" 
                 ;;
         esac
     done
@@ -421,8 +439,8 @@ create_lxc_git() {
     echo "  Hostname     : $CTHOST"
     echo "  IP Address   : $CT_IP (DHCP)"
     echo "  Usuário      : root"
-    echo "  Senha        : $CTPASS"
-    echo "  SSH Acesso   : ssh root@$CT_IP"
+    echo "  Acesso Host  : pct enter $CTID"
+    echo "  SSH Status   : $SSH_STATUS"
     echo "  Projeto Git  : $PROJECT_DIR"
     echo "==============================================="
     read -p "Pressione ENTER para voltar..."
@@ -522,7 +540,7 @@ manage_snapshots() {
 show_menu() {
     clear
     log "==============================================="
-    log "   PROXMOX MASTER SUITE v2.2 (HOST: $HOSTNAME)"
+    log "   PROXMOX MASTER SUITE v2.3 (HOST: $HOSTNAME)"
     log "==============================================="
     echo "  [1] EXPORTAR VMs (Backup com Nome da VM)"
     echo "  [2] IMPORTAR VMs (Restaurar Backup)"
